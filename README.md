@@ -1,5 +1,8 @@
 # MultiLayerJailbreakDetection
-Detects jailbreaks across multiple neural network layers using Activation Oracles.
+Detects jailbreaks across multiple neural network layers using Activation Oracles
+
+# Goal
+This project studies how jailbreak behavior arises from distributed activation patterns across multiple layers of a language model. We build on LatentQA-style activation→text decoding and Activation Oracles to detect and explain multi-layer jailbreak circuits in natural language. 
 
 key papers:
 - LatentQA: https://huggingface.co/papers/2412.08686
