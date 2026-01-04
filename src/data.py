@@ -14,4 +14,4 @@ def generate_jailbreak_dataset(n_examples=1000):
 
 if __name__ == "__main__":
     data = generate_jailbreak_dataset(10)
-    print(f"✅ Module 1 complete: {len(data)} examples ready")
+    print(f" Module 1 complete: {len(data)} examples ready")
