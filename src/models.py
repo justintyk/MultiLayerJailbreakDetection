@@ -8,7 +8,7 @@ def load_activation_oracle(model_name="adamkarvonen/gemma-2-2b-activation-oracle
     # TODO: Real loading when GPU available
     tokenizer = None
     model = None
-    print("✅ Module 2 stub: Karvonen AO ready (GPU needed)")
+    print(" Module 2 stub: Karvonen AO ready (GPU needed)")
     return tokenizer, model
 
 if __name__ == "__main__":
