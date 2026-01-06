@@ -5,4 +5,8 @@ datasets
 pandas
 matplotlib
 accelerate
-
+numpy
+scikit-learn
+wandb
+peft
+bitsandbytes
