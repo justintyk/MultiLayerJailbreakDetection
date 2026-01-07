@@ -7,9 +7,10 @@ from typing import Dict, List, Tuple
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from peft import PeftConfig, PeftModel
+
 # Default Activation Oracle checkpoint from Karvonen's HF collection
-# e.g. Gemma-2-based AO; you can swap to a different AO model if needed.
-DEFAULT_AO_NAME = "adamkarvonen/gemma-2-2b-activation-oracle"
+DEFAULT_AO_NAME = "adamkarvonen/checkpoints_cls_latentqa_past_lens_gemma-3-1b-it"
 
 
 def load_activation_oracle(
@@ -30,12 +31,26 @@ def load_activation_oracle(
         tokenizer: HF tokenizer for the AO.
         model:     HF causal LM for the AO, moved to the requested device.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    device = torch.device(device)
+
+    # Get base model name
+    peft_cfg = PeftConfig.from_pretrained(model_name)
+    base_name = peft_cfg.base_model_name_or_path
+
+    # Load tokenizer & model
+    tokenizer = AutoTokenizer.from_pretrained(base_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_name,
+        low_cpu_mem_usage=True,
+    )
+
+    model = PeftModel.from_pretrained(base_model, model_name)
     model.to(device)
     model.eval()
     return tokenizer, model
-
 
 class MultiLayerActivationOracle:
     """
@@ -65,12 +80,12 @@ class MultiLayerActivationOracle:
         Aggregate activations from multiple layers into a single tensor.
 
         Args:
-            activations_by_layer:
-                Dict[layer_index -> activation tensor], where each tensor
-                is typically [num_positions, hidden_dim] extracted from the base LM.
+            activations_by_layer: dict[layer -> tensor[T, D]]
+              - T = number of token positions you saved for that layer
+              - D = hidden_dim
 
         Returns:
-            aggregated: Tensor of shape [K, hidden_dim] to be injected at K
+            aggregated: Tensor of shape [K, D] to be injected at K
                         placeholder positions in the AO prompt.
 
         NOTE:
@@ -79,20 +94,16 @@ class MultiLayerActivationOracle:
             can concatenate or average over layers; more advanced variants can
             use learned mixing or attention across layers.
         """
-        # concatenate all positions across all layers
-        # Take the first K vectors (or average if needed). 
-        # Replace his with the preferred multi-layer aggregation scheme.
-        
-        all_acts: List[torch.Tensor] = []
-        for layer_idx in sorted(activations_by_layer.keys()):
-            acts = activations_by_layer[layer_idx]  # [T, D]
-            all_acts.append(acts)
-
-        if not all_acts:
+        if not activations_by_layer:
             raise ValueError("No activations provided to MultiLayerActivationOracle.")
 
-        concatenated = torch.cat(all_acts, dim=0)  # [K, D]
-        return concatenated
+        mean_acts = []
+        for layer in sorted(activations_by_layer.keys()):
+            acts = activations_by_layer[layer]  # [T, D]            
+            mean_acts.append(acts.mean(dim=0))  # [D]
+
+        aggregated = torch.stack(mean_acts, dim=0)  # [K, D]
+        return aggregated.to(self.device)
 
     def build_oracle_prompt(
         self,
