@@ -73,9 +73,17 @@ class ActivationHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [K, D] or [D]; we reduce over K if needed
-        if x.dim() == 2:
-            x = x.mean(dim=0)  # simple pooling over positions
+        """Run the classifier head.
+
+        Expected shapes:
+          - [B, D]    : batch of already-pooled representations
+          - [B, K, D] : batch with K layers per example
+          - [D]       : single example (we add a batch dim)
+        """
+        if x.dim() == 3: # [B, K, D] -> [B, D] (mean pool over K)
+            x = x.mean(dim=1)
+        elif x.dim() == 1: # [D] -> [1, D]
+            x = x.unsqueeze(0)
         return self.net(x)
 
 
