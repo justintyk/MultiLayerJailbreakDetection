@@ -13,6 +13,13 @@ from typing import Dict, List, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+import sys
+import os
+
+# Add the project root directory to sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
 from src.data import generate_synthetic_multilayer_dataset
 from src.models import MultiLayerActivationOracle
 from src.train import MultiLayerJailbreakDataset, LABEL_MAP
