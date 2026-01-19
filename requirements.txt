@@ -10,4 +10,4 @@ scikit-learn
 wandb
 peft
 bitsandbytes
-peft
+jailbreakbench
