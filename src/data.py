@@ -10,9 +10,7 @@ The key idea is that each example contains:
     - meta:                 optional metadata (prompt, source, model, etc.)
     - prompt:               the actual text prompt that generated activations
 
-This module supports both:
-    1. Synthetic activation generation (for testing/development)
-    2. Real activation extraction from base LLMs via forward hooks
+This module supports activation extraction from base LLMs via forward hooks.
 """
 
 from __future__ import annotations
@@ -24,16 +22,9 @@ import json
 import pickle
 from pathlib import Path
 
-# Conditional imports for real activation extraction
-try:
-    import torch
-    import torch.nn as nn
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    torch = None  # type: ignore
-
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 Label = Literal["JAILBREAK", "SAFE"]
 
@@ -53,8 +44,7 @@ class MultiLayerExample:
     Structured representation of one dataset example.
 
     - activations_by_layer: maps each layer index (e.g., 7, 12, 23) to a
-      list of activation vectors (each vector is a list[float] for synthetic
-      examples, or can be torch.Tensor for real activations).
+      list of activation vectors extracted from the model.
     - label: "JAILBREAK" or "SAFE".
     - prompt: the actual text prompt that generated these activations.
     - prompt_source: dataset origin (e.g., "jailbreakbench", "safe_generated").
@@ -79,64 +69,6 @@ class MultiLayerExample:
         }
 
 
-def _synthetic_activation_vector(dim: int = 4, bias: float = 0.0) -> List[float]:
-    """
-    Create a simple synthetic activation vector.
-
-    For now this is just random noise with an optional bias; in the real
-    system this will be replaced by actual hidden states from the base LLM.
-    """
-    return [random.uniform(-1.0, 1.0) + bias for _ in range(dim)]
-
-
-def _generate_synthetic_example(
-    layer_indices: List[int],
-    dim: int = 4,
-    jailbroken: bool = True,
-) -> MultiLayerExample:
-    """
-    Generate one synthetic multi-layer example.
-
-    Intuition:
-    - JAILBREAK examples are biased toward a particular activation pattern
-      across layers (e.g., slightly shifted means).
-    - SAFE examples are drawn from a different, less aligned distribution.
-
-    This is just a stand-in until we wire in real activations from a base model.
-    """
-    activations_by_layer: Dict[int, List[List[float]]] = {}
-    for layer in layer_indices:
-        # For now, we will be using a single position per layer; later we can use multiple.
-        if jailbroken:
-            # Bias jailbreak activations slightly in positive direction
-            activations_by_layer[layer] = [
-                _synthetic_activation_vector(dim=dim, bias=+0.5)
-            ]
-        else:
-            # Bias safe activations slightly in negative direction
-            activations_by_layer[layer] = [
-                _synthetic_activation_vector(dim=dim, bias=-0.5)
-            ]
-
-    label: Label = "JAILBREAK" if jailbroken else "SAFE"
-    prompt = f"[Synthetic {'jailbreak' if jailbroken else 'safe'} prompt]"
-    prompt_source = "synthetic"
-    model_name = "synthetic"
-    meta = {
-        "description": "synthetic multi-layer example",
-        "jailbreak": str(jailbroken),
-    }
-
-    return MultiLayerExample(
-        activations_by_layer=activations_by_layer,
-        label=label,
-        prompt=prompt,
-        prompt_source=prompt_source,
-        model_name=model_name,
-        meta=meta,
-    )
-
-
 class BaseModelActivationExtractor:
     """
     Extract activations from a base LLM at specified layers.
@@ -148,7 +80,6 @@ class BaseModelActivationExtractor:
     def __init__(
         self,
         model_name: str = "google/gemma-2-2b-it",
-        device: str = "cuda",
         layer_indices: Optional[List[int]] = None,
     ):
         """
@@ -156,18 +87,11 @@ class BaseModelActivationExtractor:
         
         Args:
             model_name: HuggingFace model identifier for the base LLM.
-            device: Device to load the model on ("cuda" or "cpu").
             layer_indices: Which layers to extract activations from.
                           If None, defaults to [7, 12, 23].
         """
-        if not TORCH_AVAILABLE:
-            raise ImportError(
-                "PyTorch and transformers are required for real activation extraction. "
-                "Install with: pip install torch transformers"
-            )
-        
         self.model_name = model_name
-        self.device = torch.device(device)
+        self.device = torch.device("cuda")
         self.layer_indices = layer_indices or [7, 12, 23]
         
         # Load tokenizer and model
@@ -177,7 +101,7 @@ class BaseModelActivationExtractor:
             
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
         self.model.to(self.device)
@@ -204,7 +128,7 @@ class BaseModelActivationExtractor:
             def hook(module, input, output):
                 # output is typically a tuple; first element is hidden states
                 hidden_states = output[0] if isinstance(output, tuple) else output
-                self.activations[layer_idx] = hidden_states.detach().cpu()
+                self.activations[layer_idx] = hidden_states.detach()
             return hook
         
         for layer_idx in layer_indices:
@@ -279,40 +203,6 @@ class BaseModelActivationExtractor:
     def __del__(self):
         """Cleanup hooks on deletion."""
         self._clear_hooks()
-
-
-def generate_synthetic_multilayer_dataset(
-    n_examples: int = 1000,
-    layer_indices: List[int] | None = None,
-    dim: int = 4,
-    p_jailbreak: float = 0.5,
-) -> List[ExampleDict]:
-    """
-    Generate a synthetic dataset of multi-layer activation examples.
-
-    Args:
-        n_examples:   total number of examples.
-        layer_indices: which layers (by index) to include, e.g. [7, 12, 23].
-        dim:          dimensionality of each activation vector.
-        p_jailbreak:  fraction of examples that should be labeled JAILBREAK.
-
-    Returns:
-        List of examples in dict form, ready to be serialized or fed to
-        a DataLoader / HF datasets.
-    """
-    if layer_indices is None:
-        layer_indices = [7, 12, 23]
-
-    dataset: List[ExampleDict] = []
-    for _ in range(n_examples):
-        jailbroken = random.random() < p_jailbreak
-        ex = _generate_synthetic_example(
-            layer_indices=layer_indices,
-            dim=dim,
-            jailbroken=jailbroken,
-        )
-        dataset.append(ex.to_dict())
-    return dataset
 
 
 def load_jailbreak_prompts(
@@ -496,7 +386,7 @@ def generate_safe_prompts(
     return prompts[:n_prompts]
 
 
-def generate_real_multilayer_dataset(
+def generate_activation_multilayer_dataset(
     extractor: BaseModelActivationExtractor,
     n_jailbreak: int = 500,
     n_safe: int = 500,
@@ -505,7 +395,7 @@ def generate_real_multilayer_dataset(
     save_path: Optional[str] = None,
 ) -> List[ExampleDict]:
     """
-    Generate dataset with real activations from base LLM.
+    Generate dataset with extracted activations from base LLM.
     
     Args:
         extractor: BaseModelActivationExtractor instance.
@@ -658,50 +548,36 @@ if __name__ == "__main__":
     print("Module 1: Multi-Layer Jailbreak Dataset Generation")
     print("=" * 60)
     
-    # Test 1: Synthetic dataset (fast, for testing)
-    print("\n[Test 1] Generating synthetic dataset...")
-    random.seed(0)
-    synthetic_data = generate_synthetic_multilayer_dataset(n_examples=10)
-    print(f"✓ Generated {len(synthetic_data)} synthetic examples")
-    print(f"  Example[0] keys: {list(synthetic_data[0].keys())}")
-    print(f"  Example[0] label: {synthetic_data[0]['label']}")
-    print(f"  Example[0] prompt: {synthetic_data[0]['prompt']}")
-    
-    # Test 2: Real activation extraction (requires model download)
-    if "--real" in sys.argv:
-        print("\n[Test 2] Generating dataset with REAL activations...")
+    # Test activation extraction (requires model download)
+    if "--activation" in sys.argv:
+        print("\nGenerating dataset with extracted activations...")
         print("  (This will download the base model if not cached)")
-        
-        # Use CPU for demo; change to "cuda" for GPU
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"  Using device: {device}")
         
         # Initialize extractor
         extractor = BaseModelActivationExtractor(
             model_name="google/gemma-2-2b-it",
-            device=device,
             layer_indices=[7, 12, 23],
         )
         
-        # Generate small real dataset
-        real_data = generate_real_multilayer_dataset(
+        # Generate small dataset with extracted activations
+        activation_data = generate_activation_multilayer_dataset(
             extractor=extractor,
             n_jailbreak=5,
             n_safe=5,
-            save_path="data/real_dataset_demo.json",
+            save_path="data/activation_dataset_demo.json",
         )
         
-        print(f"✓ Generated {len(real_data)} real examples")
-        print(f"  Saved to: data/real_dataset_demo.json")
+        print(f"✓ Generated {len(activation_data)} examples with extracted activations")
+        print(f"  Saved to: data/activation_dataset_demo.json")
         
         # Show activation shapes
-        example = real_data[0]
+        example = activation_data[0]
         print(f"\n  Example activation shapes:")
         for layer, acts in example['activations_by_layer'].items():
             print(f"    Layer {layer}: {len(acts)} positions × {len(acts[0])} dims")
     else:
-        print("\n[Test 2] Skipped (use --real flag to test real extraction)")
-        print("  Example: python src/data.py --real")
+        print("\n[Test 2] Skipped (use --activation flag to test activation extraction)")
+        print("  Example: python src/data.py --activation")
     
     print("\n" + "=" * 60)
     print("Module 1: Complete")
