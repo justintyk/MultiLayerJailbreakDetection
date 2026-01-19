@@ -8,6 +8,8 @@ This work investigates whether a single high-level behavioral concept (e.g., a j
 ## Contents
 1. [Setup](#1-setup)
 2. [Dataset](#2-dataset)
+3. [Models](#3-models)
+4. [Training](#4-training)
 
 ## 1. Setup
 ```bash
@@ -137,9 +139,83 @@ dolly_only = generate_safe_prompts(
 )
 ```
 
-Command line usage:
-
 ```bash
 # Run activation extraction pipeline (requires GPU and model download)
 python src/data.py --activation
+```
+
+## 3. Models
+
+The `MultiLayerActivationOracle` wraps a pretrained Activation Oracle model and provides an interface for multi-layer activation inputs.
+
+### Usage
+
+Load and query the oracle:
+
+```python
+from src.models import MultiLayerActivationOracle
+
+# Initialize oracle (loads pretrained model from HuggingFace)
+oracle = MultiLayerActivationOracle()
+
+# Query with multi-layer activations
+activations_by_layer = {
+    7: torch.tensor([[0.1, 0.2, ...]]),   # [seq_len, hidden_dim]
+    12: torch.tensor([[0.3, 0.4, ...]]),
+    23: torch.tensor([[0.5, 0.6, ...]])
+}
+
+# Get natural language prediction
+answer = oracle.predict_label(
+    activations_by_layer=activations_by_layer,
+    question="Is this a jailbreak attempt?",
+    layer_description="L7+L12+L23"
+)
+print(answer)  # e.g., "YES" or "NO"
+```
+
+Load a custom oracle model:
+
+```python
+from src.models import load_activation_oracle
+
+# Load specific checkpoint
+tokenizer, model = load_activation_oracle(
+    model_name="adamkarvonen/checkpoints_cls_latentqa_past_lens_gemma-3-1b-it"
+)
+```
+
+Command line usage:
+
+```bash
+# Initialize and load activation oracle
+python src/models.py
+```
+
+## 4. Training
+
+Train the Activation Oracle on multi-layer jailbreak detection using full activation-conditioned SFT.
+
+### Basic Training
+
+Binary classification (SAFE vs JAILBREAK):
+
+```bash
+python src/train.py --n_examples 1000
+```
+
+### Programmatic Usage
+
+```python
+from src.train import train_full_oracle_sft
+
+# Train with default settings
+trainer = train_full_oracle_sft(
+    n_examples=1000,
+    batch_size=8,
+    num_epochs=3,
+    learning_rate=2e-5,
+    use_extended_taxonomy=False,
+    output_dir="./oracle_sft_output"
+)
 ```
