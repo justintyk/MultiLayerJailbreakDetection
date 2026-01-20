@@ -6,26 +6,46 @@ An end-to-end Activation Oracle model for detecting jailbreaks across multiple n
 This work investigates whether a single high-level behavioral concept (e.g., a jailbreak behavior) corresponds to multiple distinct activation patterns inside a large language model (LLM). We train an Activation Oracle that takes multi-layer activations from a target LLM and outputs natural-language safety assessments, enabling us to detect distributed jailbreak patterns that span multiple layers. Our approach uses activation-conditioned training following the LatentQA paradigm, where activation vectors are injected at placeholder positions during supervised fine-tuning.
 
 ## Contents
-1. [Dataset](#1-dataset)
-2. [Pre-trained Models](#2-pre-trained-models)
-3. [Setup](#3-setup)
-4. [Usage](#4-usage)
+1. [Setup](#1-setup)
+2. [Dataset](#2-dataset)
+3. [Usage](#3-usage)
 
-## 1. Dataset
+## 1. Setup
+
+Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## 2. Dataset
 
 Generate multi-layer activation dataset from jailbreak and safe prompts:
 
 ```bash
 python src/data.py --activation
 ```
-Dataset is saved to: `data/activation_dataset_demo.json`
 
-## 2. Setup
+### Configuration
 
-Install dependencies:
-```bash
-pip install -r requirements.txt
+To modify the dataset size or model configuration, edit the parameters in `src/data.py`:
+
+```python
+# Initialize extractor
+extractor = BaseModelActivationExtractor(
+    model_name="google/gemma-2-2b-it",
+    layer_indices=[7, 12, 23],
+)
+
+# Generate dataset
+activation_data = generate_activation_multilayer_dataset(
+    extractor=extractor,
+    n_jailbreak=5,
+    n_safe=5,
+    save_path="data/activation_dataset_demo.json",
+)
 ```
+
+Dataset is saved to `data/activation_dataset_demo.json`
 
 ## 3. Usage
 
