@@ -4,12 +4,6 @@ Module 1: Data & Tasks - Generate multi-layer jailbreak dataset.
 This module defines the data schema and generators for our multi-layer 
 activation-level jailbreak detection task.
 
-The key idea is that each example contains:
-    - activations_by_layer: dict[layer_idx -> tensor-like list of floats]
-    - label:                "JAILBREAK" or "SAFE"
-    - meta:                 optional metadata (prompt, source, model, etc.)
-    - prompt:               the actual text prompt that generated activations
-
 This module supports activation extraction from base LLMs via forward hooks.
 """
 
@@ -28,43 +22,40 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 Label = Literal["JAILBREAK", "SAFE"]
 
-
+"""
+Each example in the dataset has the following structure:
+    - activations_by_layer: dict[layer_idx -> tensor-like list of floats]
+    - label:                "JAILBREAK" or "SAFE"
+    - prompt:               the actual text prompt that generated activations
+    - meta:                 optional metadata (prompt, source, model, etc.)
+"""
 class ExampleDict(TypedDict):
     activations_by_layer: Dict[int, List[List[float]]]
     label: Label
-    meta: Dict[str, str]
+    meta: Dict[str, Any]
     prompt: str
-    prompt_source: str
-    model_name: str
 
 
 @dataclass
 class MultiLayerExample:
     """
     Structured representation of one dataset example.
-
     - activations_by_layer: maps each layer index (e.g., 7, 12, 23) to a
       list of activation vectors extracted from the model.
     - label: "JAILBREAK" or "SAFE".
     - prompt: the actual text prompt that generated these activations.
-    - prompt_source: dataset origin (e.g., "jailbreakbench", "safe_generated").
-    - model_name: which base LLM was used for activation extraction.
-    - meta: optional additional metadata.
+    - meta: optional metadata (prompt_source, model_name, position, etc.)
     """
     activations_by_layer: Dict[int, List[List[float]]]
     label: Label
     prompt: str
-    prompt_source: str
-    model_name: str
-    meta: Dict[str, str]
+    meta: Dict[str, Any]
 
     def to_dict(self) -> ExampleDict:
         return {
             "activations_by_layer": self.activations_by_layer,
             "label": self.label,
             "prompt": self.prompt,
-            "prompt_source": self.prompt_source,
-            "model_name": self.model_name,
             "meta": self.meta,
         }
 
@@ -73,8 +64,8 @@ class BaseModelActivationExtractor:
     """
     Extract activations from a base LLM at specified layers.
     
-    This class loads a base model (e.g., Gemma, Llama) and registers forward
-    hooks to capture hidden states at specified layers during inference.
+    This class loads a base model and registers forward hooks to capture hidden
+    states at specified layers during inference.
     """
     
     def __init__(
@@ -107,16 +98,16 @@ class BaseModelActivationExtractor:
         self.model.to(self.device)
         self.model.eval()
         
-        # Storage for captured activations
+        # Store activations
         self.activations: Dict[int, torch.Tensor] = {}
         self.hooks = []
         
     def _register_hooks(self, layer_indices: List[int]) -> None:
-        """Register forward hooks on specified layers to capture activations."""
+        """Register forward hooks to capture activations on specified layers."""
         self._clear_hooks()
         self.activations = {}
         
-        # Get the model's layers (works for most transformer architectures)
+        # Get the model's layers
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
             layers = self.model.model.layers  # Gemma, Llama structure
         elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
@@ -185,7 +176,7 @@ class BaseModelActivationExtractor:
         result = {}
         for layer_idx, acts in self.activations.items():
             # acts shape: [batch_size, seq_len, hidden_dim]
-            # We assume batch_size = 1
+            # We assume batch_size = 1 (one prompt at a time)
             acts = acts[0]  # [seq_len, hidden_dim]
             
             if position == "last":
@@ -206,55 +197,44 @@ class BaseModelActivationExtractor:
 
 
 def load_jailbreak_prompts(
-    dataset_name: str = "jailbreakbench",
-    split: str = "all",
     max_examples: Optional[int] = None,
 ) -> List[Dict[str, str]]:
     """
-    Load jailbreak prompts from established datasets.
+    Load jailbreak prompts from JailbreakBench dataset.
     
     Args:
-        dataset_name: Name of the dataset ("jailbreakbench" supported).
-        split: Which split to load ("all", "harmful", etc.).
         max_examples: Maximum number of examples to load (None = all).
     
     Returns:
-        List of dicts with keys: "prompt", "source", "category" (optional).
+        List of dicts with keys: "prompt", "source".
     """
-    prompts = []
-    
-    if dataset_name == "jailbreakbench":
-        try:
-            import jailbreakbench as jbb
+    try:
+        import jailbreakbench as jbb
+        
+        # Load JailbreakBench behaviors
+        behaviors = jbb.read_dataset()
+        
+        prompts = []
+        for behavior in behaviors:            
+            prompts.append({
+                "prompt": behavior.Behavior, # jailbreak prompt
+                "source": "jailbreakbench",
+            })
             
-            # Load JailbreakBench behaviors
-            behaviors = jbb.read_dataset()
-            
-            for behavior in behaviors:
-                # Each behavior has a 'Behavior' field with the harmful request
-                prompts.append({
-                    "prompt": behavior.Behavior,
-                    "source": "jailbreakbench",
-                    "category": getattr(behavior, "Category", "unknown"),
-                })
+            if max_examples and len(prompts) >= max_examples:
+                break
                 
-                if max_examples and len(prompts) >= max_examples:
-                    break
-                    
-        except ImportError:
-            raise ImportError(
-                "jailbreakbench package not installed. "
-                "Install with: pip install jailbreakbench"
-            )
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    except ImportError:
+        raise ImportError(
+            "jailbreakbench package not installed. "
+            "Install with: pip install jailbreakbench"
+        )
     
     return prompts
 
 
 def generate_safe_prompts(
     n_prompts: int = 100,
-    include_hard_negatives: bool = True,
     dataset_sources: List[str] = ["alpaca", "dolly"],
 ) -> List[Dict[str, str]]:
     """
@@ -262,12 +242,10 @@ def generate_safe_prompts(
     
     Args:
         n_prompts: Number of safe prompts to load.
-        include_hard_negatives: Whether to include prompts that are
-                               structurally similar to jailbreaks but safe.
         dataset_sources: Which datasets to load from. Options: "alpaca", "dolly".
     
     Returns:
-        List of dicts with keys: "prompt", "source", "category".
+        List of dicts with keys: "prompt", "source".
     """
     prompts = []
     
@@ -279,7 +257,7 @@ def generate_safe_prompts(
             # Load cleaned Alpaca dataset from HuggingFace
             alpaca_data = load_dataset("tatsu-lab/alpaca", split="train")
             
-            # Sample from Alpaca
+            # Sample from Alpaca (evenly across all safe datasets)
             n_alpaca = min(n_prompts // len(dataset_sources), len(alpaca_data))
             alpaca_sample = alpaca_data.shuffle(seed=42).select(range(n_alpaca))
             
@@ -297,7 +275,6 @@ def generate_safe_prompts(
                 prompts.append({
                     "prompt": prompt,
                     "source": "alpaca",
-                    "category": "instruction_following",
                 })
                 
                 if len(prompts) >= n_prompts:
@@ -325,7 +302,6 @@ def generate_safe_prompts(
                 # Dolly format: instruction + context -> response
                 instruction = example["instruction"]
                 context = example.get("context", "")
-                category = example.get("category", "unknown")
                 
                 # Combine instruction and context if context exists
                 if context:
@@ -336,7 +312,6 @@ def generate_safe_prompts(
                 prompts.append({
                     "prompt": prompt,
                     "source": "dolly",
-                    "category": category,
                 })
                 
                 if len(prompts) >= n_prompts:
@@ -347,41 +322,6 @@ def generate_safe_prompts(
             print("Install with: pip install datasets")
         except Exception as e:
             print(f"Warning: Could not load Dolly dataset: {e}")
-    
-    # Add hard negatives if requested and we still need more prompts
-    if include_hard_negatives and len(prompts) < n_prompts:
-        hard_negative_templates = [
-            "Pretend you are a teacher and explain {topic}.",
-            "Imagine you are writing a fictional story about {topic}.",
-            "Act as a historian and describe {topic}.",
-            "You are a helpful assistant. Please explain {topic}.",
-            "In a hypothetical scenario where you're teaching a class, how would you explain {topic}?",
-        ]
-        
-        safe_topics = [
-            "the importance of education",
-            "how to grow a garden",
-            "the history of art",
-            "basic first aid",
-            "time management skills",
-            "the scientific method",
-            "different cultures around the world",
-            "the importance of sleep",
-            "how to learn a new language",
-            "the basics of cooking",
-        ]
-        
-        for template in hard_negative_templates:
-            for topic in safe_topics:
-                prompts.append({
-                    "prompt": template.format(topic=topic),
-                    "source": "hard_negative_generated",
-                    "category": "hard_negative",
-                })
-                if len(prompts) >= n_prompts:
-                    break
-            if len(prompts) >= n_prompts:
-                break
     
     return prompts[:n_prompts]
 
@@ -442,10 +382,9 @@ def generate_activation_multilayer_dataset(
             activations_by_layer=activations_list,
             label="JAILBREAK",
             prompt=prompt_dict["prompt"],
-            prompt_source=prompt_dict["source"],
-            model_name=extractor.model_name,
             meta={
-                "category": prompt_dict.get("category", "unknown"),
+                "prompt_source": prompt_dict["source"],
+                "model_name": extractor.model_name,
                 "position": position,
             },
         )
@@ -472,10 +411,9 @@ def generate_activation_multilayer_dataset(
             activations_by_layer=activations_list,
             label="SAFE",
             prompt=prompt_dict["prompt"],
-            prompt_source=prompt_dict["source"],
-            model_name=extractor.model_name,
             meta={
-                "category": prompt_dict.get("category", "unknown"),
+                "prompt_source": prompt_dict["source"],
+                "model_name": extractor.model_name,
                 "position": position,
             },
         )
