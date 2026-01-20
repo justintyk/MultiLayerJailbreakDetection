@@ -211,13 +211,15 @@ def load_jailbreak_prompts(
     try:
         import jailbreakbench as jbb
         
-        # Load JailbreakBench behaviors
-        behaviors = jbb.read_dataset()
+        # Load JailbreakBench dataset
+        dataset = jbb.read_dataset()
+        goals = dataset.goals  # The actual jailbreak prompts
         
+        # Store jailbreak prompts
         prompts = []
-        for behavior in behaviors:            
+        for goal in goals:            
             prompts.append({
-                "prompt": behavior.Behavior, # jailbreak prompt
+                "prompt": goal,  # jailbreak prompt
                 "source": "jailbreakbench",
             })
             
