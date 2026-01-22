@@ -239,6 +239,138 @@ class MultiLayerActivationOracle:
         full_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         answer = full_text[len(prompt):].strip()  # naive post-processing
         return answer
+    
+    def label_intervention(
+        self,
+        intervention_activations: Dict[int, torch.Tensor],
+        rubric,  # RubricDefinition from rubrics.py
+        max_new_tokens: int = 32,
+        strategy: str = "mean"
+    ) -> Tuple[str, float]:
+        """
+        Use Activation Oracle to interpret intervention in activation space.
+        
+        This is the key Phase 4 functionality: the AO operates purely on
+        activation patterns to provide semantic interpretation of successful
+        interventions, without needing to see the generated text.
+        
+        Args:
+            intervention_activations: f'(x,c) = f(x) + δf
+                Dict mapping layer_idx -> intervened activation tensor
+            rubric: RubricDefinition with rubric_text and target_answer
+            max_new_tokens: Max tokens for AO response
+            strategy: Aggregation strategy for multi-layer activations
+            
+        Returns:
+            (label, confidence): Semantic label and confidence score
+            
+        Example:
+            >>> intervened_acts = {12: torch.randn(1, 2048)}
+            >>> rubric = RubricDefinition(
+            ...     rubric_text="Bypasses safety refusals",
+            ...     target_answer="provides harmful content",
+            ...     category="jailbreak"
+            ... )
+            >>> label, conf = oracle.label_intervention(intervened_acts, rubric)
+            >>> print(f"Label: {label}, Confidence: {conf}")
+        """
+        # Build AO query focusing on rubric satisfaction
+        layer_desc = "+".join([f"L{layer}" for layer in sorted(intervention_activations.keys())])
+        
+        question = (
+            f"Does this activation pattern exhibit the behavior: '{rubric.rubric_text}' "
+            f"with property: '{rubric.target_answer}'? "
+            f"Answer with: [LABEL], [CONFIDENCE 0-1]"
+        )
+        
+        # Query AO with intervened activations
+        response = self.predict_label(
+            activations_by_layer=intervention_activations,
+            question=question,
+            layer_description=layer_desc,
+            max_new_tokens=max_new_tokens
+        )
+        
+        # Parse response for label and confidence
+        label, confidence = self._parse_ao_response(response)
+        
+        return label, confidence
+    
+    def _parse_ao_response(self, response: str) -> Tuple[str, float]:
+        """
+        Parse AO response to extract label and confidence.
+        
+        Expected format: "[LABEL], [CONFIDENCE]"
+        Example: "Roleplay-Jailbreak, 0.85"
+        
+        Args:
+            response: Raw AO response string
+            
+        Returns:
+            (label, confidence): Parsed label and confidence score
+        """
+        try:
+            # Try to parse structured response
+            parts = response.split(',')
+            if len(parts) >= 2:
+                label = parts[0].strip()
+                confidence_str = parts[1].strip()
+                
+                # Extract numeric confidence
+                import re
+                conf_match = re.search(r'(\d+\.?\d*)', confidence_str)
+                if conf_match:
+                    confidence = float(conf_match.group(1))
+                    # Ensure confidence is in [0, 1]
+                    if confidence > 1.0:
+                        confidence = confidence / 100.0
+                else:
+                    confidence = 0.5  # Default if parsing fails
+                
+                return label, confidence
+            else:
+                # Fallback: use entire response as label
+                return response.strip(), 0.5
+                
+        except Exception as e:
+            print(f"Warning: Failed to parse AO response '{response}': {e}")
+            return response.strip(), 0.5
+    
+    def batch_label_interventions(
+        self,
+        interventions: List[Dict[int, torch.Tensor]],
+        rubrics: List,  # List[RubricDefinition]
+        max_new_tokens: int = 32,
+        strategy: str = "mean"
+    ) -> List[Tuple[str, float]]:
+        """
+        Label multiple interventions in batch.
+        
+        Args:
+            interventions: List of intervention activation dicts
+            rubrics: List of corresponding rubrics
+            max_new_tokens: Max tokens for AO responses
+            strategy: Aggregation strategy
+            
+        Returns:
+            List of (label, confidence) tuples
+        """
+        if len(interventions) != len(rubrics):
+            raise ValueError(
+                f"Mismatch: {len(interventions)} interventions but {len(rubrics)} rubrics"
+            )
+        
+        results = []
+        for intervention_acts, rubric in zip(interventions, rubrics):
+            label, conf = self.label_intervention(
+                intervention_acts,
+                rubric,
+                max_new_tokens=max_new_tokens,
+                strategy=strategy
+            )
+            results.append((label, conf))
+        
+        return results
 
 
 if __name__ == "__main__":
