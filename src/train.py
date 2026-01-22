@@ -1,372 +1,465 @@
 """
-Module 3: Training - Fine-tune Activation Oracle on multi-layer jailbreak dataset.
+Module: Policy Training - Train policy network to discover jailbreak interventions.
 
-This module wires together:
-    - the multi-layer activation dataset from src.data
-    - the Activation Oracle wrapper from src.models
-    - supervised fine-tuning that optimizes a jailbreak detection objective
+This module implements the training loop for the policy network, following
+the investigator agent framework adapted to activation space.
 
-This implementation uses TRL's SFTTrainer with a custom data collator for
-full activation-conditioned training following the LatentQA paradigm.
+Training phases:
+1. Exploration: Random perturbation sampling to find seed directions
+2. Policy Gradient: REINFORCE with baseline and entropy regularization
+3. Logging: Track metrics and save checkpoints
+
+Key components:
+- exploration_phase(): Random search for successful interventions
+- policy_gradient_phase(): Train policy with REINFORCE
+- train_policy(): Main training loop
 """
 
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
-
+from typing import List, Dict, Tuple, Optional
 import torch
-from torch.utils.data import Dataset
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+from pathlib import Path
+import json
+from tqdm import tqdm
 
-from transformers import TrainingArguments
-from trl import SFTTrainer
-from data import load_dataset, generate_activation_multilayer_dataset, BaseModelActivationExtractor
-from models import MultiLayerActivationOracle
-
-
-# Extended label taxonomy for richer jailbreak classification
-LABEL_MAP: Dict[str, int] = {
-    "SAFE": 0,
-    "JAILBREAK": 1,
-    "JAILBREAK_ROLEPLAY": 2,
-    "JAILBREAK_OBFUSCATION": 3,
-    "JAILBREAK_PROMPT_INJECTION": 4,
-}
-
-LABEL_MAP_BINARY: Dict[str, int] = {
-    "SAFE": 0,
-    "JAILBREAK": 1,
-}
+from src.policy import ConceptExplainer
+from src.intervention import InterventionPipeline
+from src.rubrics import RubricDefinition, Verifier
+from src.data import BaseModelActivationExtractor
 
 
-class MultiLayerJailbreakDataset(Dataset):
+class PolicyTrainingDataset(Dataset):
     """
-    Dataset wrapper for activation examples with full activation data.
-
-    Each item contains:
-        - activations_by_layer: dict[int -> tensor]
-        - label: str (e.g., "SAFE", "JAILBREAK")
-        - text: str (prompt + completion for training)
-    """
-
-    def __init__(
-        self, 
-        examples: List[dict],
-        oracle: MultiLayerActivationOracle,
-        use_extended_taxonomy: bool = False,
-    ) -> None:
-        self.examples = examples
-        self.oracle = oracle
-        self.use_extended_taxonomy = use_extended_taxonomy
-        self.label_map = LABEL_MAP if use_extended_taxonomy else LABEL_MAP_BINARY
-
-    def __len__(self) -> int:
-        return len(self.examples)
-
-    def __getitem__(self, idx: int):
-        ex = self.examples[idx]
-        
-        # Convert activations to tensors
-        activations_by_layer = {
-            int(layer): torch.tensor(vectors, dtype=torch.float32)
-            for layer, vectors in ex["activations_by_layer"].items()
-        }
-        
-        label_str = ex["label"]
-        
-        # Build completion text based on label
-        if self.use_extended_taxonomy:
-            completions = {
-                "SAFE": "SAFE - No jailbreak detected.",
-                "JAILBREAK": "JAILBREAK - Generic jailbreak attempt detected.",
-                "JAILBREAK_ROLEPLAY": "JAILBREAK_ROLEPLAY - Roleplay-based safety bypass detected.",
-                "JAILBREAK_OBFUSCATION": "JAILBREAK_OBFUSCATION - Obfuscation-based jailbreak detected.",
-                "JAILBREAK_PROMPT_INJECTION": "JAILBREAK_PROMPT_INJECTION - Prompt injection attack detected.",
-            }
-            completion = completions.get(label_str, completions["JAILBREAK"])
-        else:
-            if label_str == "SAFE":
-                completion = "SAFE - This is a benign interaction."
-            else:
-                completion = "JAILBREAK - This is a jailbreak attempt."
-        
-        # Build oracle prompt with placeholders
-        num_layers = len(activations_by_layer)
-        layer_desc = "+".join([f"L{layer}" for layer in sorted(activations_by_layer.keys())])
-        
-        question = "Analyze this activation pattern. Is it a jailbreak?"
-        prompt = self.oracle.build_oracle_prompt(
-            layer_description=layer_desc,
-            num_placeholders=num_layers,
-            question=question,
-        )
-        
-        # Combine for training
-        text = f"{prompt}\n{completion}"
-        
-        return {
-            "text": text,
-            "activations_by_layer": activations_by_layer,
-            "label": label_str,
-        }
-
-
-class ActivationInjectionCollator:
-    """
-    Custom data collator that injects activation vectors during training.
+    Dataset for policy training.
     
-    This is the key component that makes activation-conditioned training work.
-    It replaces placeholder tokens with actual activation embeddings during
-    the forward pass, following the LatentQA/Activation Oracle paradigm.
+    Each example contains:
+    - rubric: RubricDefinition
+    - base_activation: f(x) from neutral prompt
+    - prompt: Neutral prompt text
     """
     
-    def __init__(
-        self,
-        tokenizer,
-        oracle: MultiLayerActivationOracle,
-        max_length: int = 512,
-    ):
-        self.tokenizer = tokenizer
-        self.oracle = oracle
-        self.max_length = max_length
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Get placeholder token ID
-        self.placeholder_token_id = self.tokenizer.encode(
-            self.oracle.placeholder_token,
-            add_special_tokens=False
-        )[0]
-    
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __init__(self, examples: List[Dict]):
         """
-        Process a batch and inject activations into embeddings.
+        Initialize dataset.
         
         Args:
-            batch: List of examples from MultiLayerJailbreakDataset
-            
-        Returns:
-            Dict with inputs_embeds, attention_mask, and labels
+            examples: List of dicts with keys: rubric, base_activation, prompt
         """
-        # Tokenize all texts in batch
-        texts = [ex["text"] for ex in batch]
-        tokenized = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        
-        input_ids = tokenized["input_ids"].to(self.device)
-        attention_mask = tokenized["attention_mask"].to(self.device)
-        
-        # Get embedding layer
-        if hasattr(self.oracle.model, 'get_input_embeddings'):
-            embed_layer = self.oracle.model.get_input_embeddings()
-        elif hasattr(self.oracle.model.base_model, 'get_input_embeddings'):
-            embed_layer = self.oracle.model.base_model.get_input_embeddings()
-        else:
-            raise AttributeError("Cannot find embedding layer")
-        
-        # Get base embeddings
-        embeddings = embed_layer(input_ids)  # [batch_size, seq_len, hidden_dim]
-        
-        # Inject activations for each example in batch
-        for i, ex in enumerate(batch):
-            activations_by_layer = ex["activations_by_layer"]
-            
-            # Aggregate multi-layer activations
-            agg_acts = self.oracle._encode_multi_layer_activations(
-                activations_by_layer
-            )  # [K, D] where K = num layers
-            
-            # Find placeholder positions in this example
-            placeholder_positions = (input_ids[i] == self.placeholder_token_id).nonzero(as_tuple=True)[0]
-            
-            # Inject activation vectors at placeholder positions
-            num_to_inject = min(len(placeholder_positions), agg_acts.shape[0])
-            for j in range(num_to_inject):
-                pos = placeholder_positions[j]
-                embeddings[i, pos, :] = agg_acts[j, :]
-        
-        # Create labels (same as input_ids for causal LM training)
-        labels = input_ids.clone()
-        
-        return {
-            "inputs_embeds": embeddings,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
+        self.examples = examples
+    
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        return self.examples[idx]
 
 
-def train_full_oracle_sft(
-    n_examples: int = 1000,
+def exploration_phase(
+    concept_explainer: ConceptExplainer,
+    intervention_pipeline: InterventionPipeline,
+    verifier: Verifier,
+    rubrics: List[RubricDefinition],
+    neutral_prompts: List[str],
+    extractor: BaseModelActivationExtractor,
+    layer_idx: int,
+    n_samples_per_rubric: int = 100,
+    epsilon: float = 0.1,
+    success_threshold: float = 0.7,
+    device: str = "cuda"
+) -> List[Dict]:
+    """
+    Exploration phase: Random perturbation sampling to find seed directions.
+    
+    For each rubric:
+    1. Sample neutral prompts
+    2. Extract base activations f(x)
+    3. Sample random interventions δf ~ N(0, σ²I)
+    4. Apply intervention and generate response
+    5. Verify with text-based verifier
+    6. Store successful interventions
+    
+    Args:
+        concept_explainer: ConceptExplainer (not used yet, for consistency)
+        intervention_pipeline: InterventionPipeline for applying interventions
+        verifier: Verifier for scoring responses
+        rubrics: List of rubrics to explore
+        neutral_prompts: List of neutral prompts
+        extractor: BaseModelActivationExtractor for getting base activations
+        layer_idx: Layer to intervene on
+        n_samples_per_rubric: Number of random samples per rubric
+        epsilon: Norm constraint coefficient
+        success_threshold: Verifier score threshold for success
+        device: Device to run on
+        
+    Returns:
+        List of successful intervention examples
+    """
+    successful_examples = []
+    
+    print(f"\n{'='*60}")
+    print("EXPLORATION PHASE: Random Perturbation Sampling")
+    print(f"{'='*60}")
+    
+    for rubric in rubrics:
+        print(f"\nExploring rubric: {rubric.rubric_text[:50]}...")
+        
+        rubric_successes = 0
+        
+        for i in tqdm(range(n_samples_per_rubric), desc="Sampling"):
+            # 1. Sample neutral prompt
+            prompt = np.random.choice(neutral_prompts)
+            
+            # 2. Extract base activation
+            activations = extractor.extract_activations(
+                prompt=prompt,
+                layer_indices=[layer_idx],
+                position="last"
+            )
+            base_f = torch.tensor(
+                activations[layer_idx][0],
+                dtype=torch.float32,
+                device=device
+            )
+            
+            # 3. Sample random intervention
+            d_hidden = base_f.shape[0]
+            delta_f = torch.randn(d_hidden, device=device)
+            
+            # Normalize to satisfy constraint
+            max_norm = epsilon * torch.norm(base_f)
+            delta_f = delta_f / torch.norm(delta_f) * max_norm * torch.rand(1, device=device)
+            
+            # 4. Apply intervention and generate response
+            try:
+                response = intervention_pipeline.apply_intervention(
+                    prompt=prompt,
+                    layer_idx=layer_idx,
+                    delta_f=delta_f,
+                    position="last",
+                    max_new_tokens=100
+                )
+                
+                # 5. Verify with text-based verifier
+                score = verifier.verify(rubric, response)
+                
+                # 6. Store if successful
+                if score >= success_threshold:
+                    successful_examples.append({
+                        'rubric': rubric,
+                        'base_activation': base_f.cpu(),
+                        'intervention': delta_f.cpu(),
+                        'prompt': prompt,
+                        'response': response,
+                        'score': score,
+                        'layer_idx': layer_idx
+                    })
+                    rubric_successes += 1
+                    
+            except Exception as e:
+                print(f"  Error in sample {i}: {e}")
+                continue
+        
+        print(f"  Found {rubric_successes}/{n_samples_per_rubric} successful interventions")
+    
+    print(f"\nTotal successful interventions: {len(successful_examples)}")
+    return successful_examples
+
+
+def policy_gradient_phase(
+    concept_explainer: ConceptExplainer,
+    intervention_pipeline: InterventionPipeline,
+    verifier: Verifier,
+    training_data: List[Dict],
+    layer_idx: int,
+    n_epochs: int = 10,
     batch_size: int = 8,
-    num_epochs: int = 3,
-    learning_rate: float = 2e-5,
-    use_extended_taxonomy: bool = False,
-    output_dir: str = "./oracle_sft_output",
-    warmup_ratio: float = 0.1,
-):
+    learning_rate: float = 1e-4,
+    gamma: float = 0.99,
+    entropy_coef: float = 0.01,
+    device: str = "cuda",
+    save_dir: Optional[str] = None
+) -> ConceptExplainer:
     """
-    Full end-to-end supervised fine-tuning of the Activation Oracle model.
+    Policy gradient training phase using REINFORCE.
     
-    This trains the oracle to generate natural language outputs about jailbreak
-    detection, following the LatentQA paradigm. The oracle learns to condition
-    on multi-layer activations and produce interpretable safety judgments.
+    Objective: max E_{δf ~ p_θ(·|c)} [R(δf, c)]
+    where R(δf, c) = verifier_score(M(x; f(x) + δf), rubric)
+    
+    Uses:
+    - Baseline for variance reduction
+    - Entropy regularization to prevent mode collapse
     
     Args:
-        n_examples: Total number of examples to generate
-        batch_size: Training batch size (smaller for full model training)
-        num_epochs: Number of training epochs
-        learning_rate: Learning rate (lower for full model fine-tuning)
-        use_extended_taxonomy: Whether to use extended jailbreak categories
-        output_dir: Directory to save model checkpoints
-        warmup_ratio: Ratio of total steps to use for warmup
+        concept_explainer: ConceptExplainer to train
+        intervention_pipeline: InterventionPipeline for applying interventions
+        verifier: Verifier for scoring
+        training_data: List of training examples from exploration
+        layer_idx: Layer to intervene on
+        n_epochs: Number of training epochs
+        batch_size: Batch size
+        learning_rate: Learning rate
+        gamma: Discount factor (not used in single-step setting)
+        entropy_coef: Entropy regularization coefficient
+        device: Device to run on
+        save_dir: Directory to save checkpoints
+        
+    Returns:
+        Trained ConceptExplainer
     """
-    print("\n" + "="*60)
-    print("Full Activation Oracle SFT Training")
-    print("="*60)
+    print(f"\n{'='*60}")
+    print("POLICY GRADIENT PHASE: REINFORCE Training")
+    print(f"{'='*60}")
     
-    # 1. Generate dataset with extracted activations
-    print("\nExtracting activations from base model...")
-    extractor = BaseModelActivationExtractor(
-        model_name="google/gemma-2-2b-it",
-        layer_indices=[7, 12, 23]
+    # Setup optimizer
+    optimizer = optim.Adam(
+        concept_explainer.policy_network.parameters(),
+        lr=learning_rate
     )
     
-    examples = generate_activation_multilayer_dataset(
+    # Create dataset and dataloader
+    dataset = PolicyTrainingDataset(training_data)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True
+    )
+    
+    # Training loop
+    for epoch in range(n_epochs):
+        epoch_loss = 0.0
+        epoch_reward = 0.0
+        epoch_entropy = 0.0
+        n_batches = 0
+        
+        print(f"\nEpoch {epoch+1}/{n_epochs}")
+        
+        for batch in tqdm(dataloader, desc="Training"):
+            # Extract batch data
+            rubrics = batch['rubric']
+            base_activations = batch['base_activation'].to(device)
+            prompts = batch['prompt']
+            
+            # Sample interventions from policy
+            batch_size_actual = len(rubrics)
+            interventions = []
+            log_probs = []
+            entropies = []
+            
+            for i in range(batch_size_actual):
+                # Get distribution parameters
+                with torch.no_grad():
+                    concept_emb = concept_explainer.concept_encoder.encode(rubrics[i])
+                
+                mu, log_sigma = concept_explainer.policy_network(concept_emb)
+                
+                # Sample intervention
+                delta_f = concept_explainer.policy_network.sample(mu, log_sigma)
+                
+                # Enforce constraint
+                delta_f = concept_explainer.policy_network.enforce_constraint(
+                    delta_f,
+                    base_activations[i],
+                    epsilon=0.1
+                )
+                
+                # Compute log probability
+                log_prob = concept_explainer.policy_network.log_prob(
+                    delta_f,
+                    mu,
+                    log_sigma
+                )
+                
+                # Compute entropy (for regularization)
+                sigma = torch.exp(log_sigma)
+                entropy = 0.5 * torch.log(2 * np.pi * np.e * sigma**2).sum()
+                
+                interventions.append(delta_f)
+                log_probs.append(log_prob)
+                entropies.append(entropy)
+            
+            # Apply interventions and get rewards
+            rewards = []
+            
+            for i in range(batch_size_actual):
+                try:
+                    # Apply intervention
+                    response = intervention_pipeline.apply_intervention(
+                        prompt=prompts[i],
+                        layer_idx=layer_idx,
+                        delta_f=interventions[i],
+                        position="last",
+                        max_new_tokens=100
+                    )
+                    
+                    # Get reward from verifier
+                    score = verifier.verify(rubrics[i], response)
+                    rewards.append(score)
+                    
+                except Exception as e:
+                    print(f"  Error in batch item {i}: {e}")
+                    rewards.append(0.0)
+            
+            # Convert to tensors
+            rewards_tensor = torch.tensor(rewards, device=device)
+            log_probs_tensor = torch.stack(log_probs)
+            entropies_tensor = torch.stack(entropies)
+            
+            # Compute baseline (mean reward)
+            baseline = rewards_tensor.mean()
+            
+            # Compute policy gradient loss
+            # L = -E[log π(a|s) * (R - baseline)]
+            advantages = rewards_tensor - baseline
+            policy_loss = -(log_probs_tensor * advantages).mean()
+            
+            # Add entropy regularization
+            entropy_loss = -entropy_coef * entropies_tensor.mean()
+            
+            # Total loss
+            loss = policy_loss + entropy_loss
+            
+            # Optimize
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                concept_explainer.policy_network.parameters(),
+                max_norm=1.0
+            )
+            optimizer.step()
+            
+            # Track metrics
+            epoch_loss += loss.item()
+            epoch_reward += rewards_tensor.mean().item()
+            epoch_entropy += entropies_tensor.mean().item()
+            n_batches += 1
+        
+        # Print epoch metrics
+        avg_loss = epoch_loss / n_batches
+        avg_reward = epoch_reward / n_batches
+        avg_entropy = epoch_entropy / n_batches
+        
+        print(f"  Loss: {avg_loss:.4f}")
+        print(f"  Avg Reward: {avg_reward:.4f}")
+        print(f"  Avg Entropy: {avg_entropy:.4f}")
+        
+        # Save checkpoint
+        if save_dir and (epoch + 1) % 5 == 0:
+            save_path = Path(save_dir) / f"policy_epoch_{epoch+1}.pt"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                'epoch': epoch + 1,
+                'policy_state_dict': concept_explainer.policy_network.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'avg_reward': avg_reward,
+            }, save_path)
+            print(f"  Saved checkpoint: {save_path}")
+    
+    return concept_explainer
+
+
+def train_policy(
+    concept_explainer: ConceptExplainer,
+    intervention_pipeline: InterventionPipeline,
+    verifier: Verifier,
+    rubrics: List[RubricDefinition],
+    neutral_prompts: List[str],
+    extractor: BaseModelActivationExtractor,
+    layer_idx: int,
+    n_exploration_samples: int = 100,
+    n_training_epochs: int = 10,
+    batch_size: int = 8,
+    learning_rate: float = 1e-4,
+    save_dir: str = "checkpoints/policy",
+    device: str = "cuda"
+) -> Tuple[ConceptExplainer, List[Dict]]:
+    """
+    Main training loop: Exploration + Policy Gradient.
+    
+    Args:
+        concept_explainer: ConceptExplainer to train
+        intervention_pipeline: InterventionPipeline for applying interventions
+        verifier: Verifier for scoring
+        rubrics: List of rubrics to train on
+        neutral_prompts: List of neutral prompts
+        extractor: BaseModelActivationExtractor for base activations
+        layer_idx: Layer to intervene on
+        n_exploration_samples: Samples per rubric in exploration
+        n_training_epochs: Number of policy gradient epochs
+        batch_size: Training batch size
+        learning_rate: Learning rate
+        save_dir: Directory to save checkpoints
+        device: Device to run on
+        
+    Returns:
+        (trained_explainer, successful_examples)
+    """
+    print(f"\n{'='*60}")
+    print("POLICY TRAINING PIPELINE")
+    print(f"{'='*60}")
+    print(f"Rubrics: {len(rubrics)}")
+    print(f"Neutral prompts: {len(neutral_prompts)}")
+    print(f"Layer: {layer_idx}")
+    print(f"Exploration samples/rubric: {n_exploration_samples}")
+    print(f"Training epochs: {n_training_epochs}")
+    
+    # Phase 1: Exploration
+    successful_examples = exploration_phase(
+        concept_explainer=concept_explainer,
+        intervention_pipeline=intervention_pipeline,
+        verifier=verifier,
+        rubrics=rubrics,
+        neutral_prompts=neutral_prompts,
         extractor=extractor,
-        n_jailbreak=n_examples // 2,
-        n_safe=n_examples // 2,
-    )
-    print(f"Generated {len(examples)} examples with extracted activations")
-    
-    # 2. Initialize Activation Oracle
-    print("\nLoading Activation Oracle model...")
-    oracle = MultiLayerActivationOracle()
-    
-    # 3. Create datasets with activation data
-    from sklearn.model_selection import train_test_split
-    train_examples, val_examples = train_test_split(examples, test_size=0.2, random_state=42)
-    
-    train_dataset = MultiLayerJailbreakDataset(
-        train_examples,
-        oracle,
-        use_extended_taxonomy=use_extended_taxonomy,
-    )
-    val_dataset = MultiLayerJailbreakDataset(
-        val_examples,
-        oracle,
-        use_extended_taxonomy=use_extended_taxonomy,
+        layer_idx=layer_idx,
+        n_samples_per_rubric=n_exploration_samples,
+        device=device
     )
     
-    print(f"Train examples: {len(train_examples)}, Val examples: {len(val_examples)}")
+    if len(successful_examples) == 0:
+        print("\n⚠ No successful interventions found in exploration phase!")
+        print("  Try adjusting success_threshold or increasing n_samples")
+        return concept_explainer, []
     
-    # 4. Create custom data collator for activation injection
-    print("\nInitializing custom data collator with activation injection...")
-    data_collator = ActivationInjectionCollator(
-        tokenizer=oracle.tokenizer,
-        oracle=oracle,
-        max_length=512,
-    )
-    
-    # 5. Setup training arguments with learning rate scheduling
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
+    # Phase 2: Policy Gradient Training
+    trained_explainer = policy_gradient_phase(
+        concept_explainer=concept_explainer,
+        intervention_pipeline=intervention_pipeline,
+        verifier=verifier,
+        training_data=successful_examples,
+        layer_idx=layer_idx,
+        n_epochs=n_training_epochs,
+        batch_size=batch_size,
         learning_rate=learning_rate,
-        warmup_ratio=warmup_ratio,
-        lr_scheduler_type="cosine",
-        logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        fp16=True,
-        gradient_accumulation_steps=2,
-        report_to="none",  # Set to "wandb" if you want W&B logging
+        device=device,
+        save_dir=save_dir
     )
     
-    # 6. Create SFTTrainer with custom data collator
-    print("\nInitializing SFTTrainer with activation-conditioned training...")
-    trainer = SFTTrainer(
-        model=oracle.model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
-        dataset_text_field="text",
-        max_seq_length=512,
-    )
+    # Save final model
+    final_path = Path(save_dir) / "policy_final.pt"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'policy_state_dict': trained_explainer.policy_network.state_dict(),
+        'n_successful_examples': len(successful_examples),
+        'rubrics': [r.__dict__ for r in rubrics],
+    }, final_path)
+    print(f"\n✓ Saved final model: {final_path}")
     
-    # 7. Train
-    print("\nStarting training...")
-    print("✓ Using full activation injection during training")
-    trainer.train()
-    
-    # 8. Save final model
-    print(f"\nSaving final model to {output_dir}/final_model")
-    trainer.save_model(f"{output_dir}/final_model")
-    
-    print("\nFull Oracle SFT training complete.")
-    return trainer
-
-
-def main(
-    n_examples: int = 1000,
-    use_extended_taxonomy: bool = False,
-):
-    """
-    Main training entry point.
-    
-    Args:
-        n_examples: Number of examples to generate
-        use_extended_taxonomy: Whether to use extended jailbreak categories
-    """
-    print("\n" + "="*60)
-    print("Module 3: Multi-Layer Jailbreak Detection Training")
-    print("="*60)
-    print(f"\nExamples: {n_examples}")
-    print(f"Taxonomy: {'Extended' if use_extended_taxonomy else 'Binary'}")
-    print()
-    
-    print("Training full Activation Oracle with SFT...")
-    trainer = train_full_oracle_sft(
-        n_examples=n_examples,
-        use_extended_taxonomy=use_extended_taxonomy,
-    )
-    print("\n✓ Full Oracle SFT training complete")
-    print("  Model saved to: oracle_sft_output/final_model")
-    
-    print("\n" + "="*60)
-    print("Module 3: Training Complete")
-    print("="*60)
+    return trained_explainer, successful_examples
 
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Train multi-layer jailbreak detector")
-    parser.add_argument(
-        "--n_examples",
-        type=int,
-        default=1000,
-        help="Number of examples to generate"
-    )
-    parser.add_argument(
-        "--extended_taxonomy",
-        action="store_true",
-        help="Use extended jailbreak taxonomy instead of binary classification"
-    )
-    
-    args = parser.parse_args()
-    
-    main(
-        n_examples=args.n_examples,
-        use_extended_taxonomy=args.extended_taxonomy,
-    )
+    print("Policy Training Module")
+    print("\nThis module implements the training pipeline for the policy network.")
+    print("\nTo run training:")
+    print("  1. Create ConceptExplainer")
+    print("  2. Create InterventionPipeline with target model")
+    print("  3. Create Verifier (LLM-as-judge)")
+    print("  4. Prepare rubrics and neutral prompts")
+    print("  5. Call train_policy()")
+    print("\nSee implementation_plan.md for full details.")
+    print("\nNote: We use the pretrained Karvonen Activation Oracle as-is")
+    print("      for interpretation (no AO training needed).")
