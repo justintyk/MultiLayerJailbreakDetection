@@ -34,6 +34,7 @@ class ExampleDict(TypedDict):
     label: Label
     meta: Dict[str, Any]
     prompt: str
+    rubric: Optional[Dict[str, str]]  # NEW: {rubric_text, target_answer, category}
 
 
 @dataclass
@@ -57,6 +58,55 @@ class MultiLayerExample:
             "label": self.label,
             "prompt": self.prompt,
             "meta": self.meta,
+            "rubric": None,  # Not used in basic MultiLayerExample
+        }
+
+
+@dataclass
+class RubricExample:
+    """
+    Dataset example with rubric-based labeling for policy training.
+    
+    Following (x, R, a) structure from arXiv:2502.01236:
+    - prompt: x - Input prompt (neutral prompt)
+    - rubric_text: R - Behavior description
+    - target_answer: a - Property indicating satisfaction
+    - response: y - Model response to prompt
+    - satisfies_rubric: Ground truth label
+    - verifier_score: p_v(a | R, y) score
+    - activations_by_layer: Base activations f(x) from target model
+    - meta: Additional metadata
+    """
+    prompt: str
+    rubric_text: str
+    target_answer: str
+    category: str
+    response: str
+    satisfies_rubric: bool
+    verifier_score: float
+    activations_by_layer: Dict[int, torch.Tensor]
+    meta: Dict[str, Any]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        # Convert tensor activations to lists
+        activations_list = {
+            layer: acts.tolist() if isinstance(acts, torch.Tensor) else acts
+            for layer, acts in self.activations_by_layer.items()
+        }
+        
+        return {
+            "prompt": self.prompt,
+            "response": self.response,
+            "satisfies_rubric": self.satisfies_rubric,
+            "verifier_score": self.verifier_score,
+            "activations_by_layer": activations_list,
+            "meta": self.meta,
+            "rubric": {
+                "rubric_text": self.rubric_text,
+                "target_answer": self.target_answer,
+                "category": self.category,
+            }
         }
 
 
@@ -79,11 +129,10 @@ class BaseModelActivationExtractor:
         Args:
             model_name: HuggingFace model identifier for the base LLM.
             layer_indices: Which layers to extract activations from.
-                          If None, defaults to [7, 12, 23].
+                          If None, automatically calculates layers at 10%, 20%, 30%, 40%, 50% depth.
         """
         self.model_name = model_name
         self.device = torch.device("cuda")
-        self.layer_indices = layer_indices or [7, 12, 23]
         
         # Load tokenizer and model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -97,6 +146,22 @@ class BaseModelActivationExtractor:
         )
         self.model.to(self.device)
         self.model.eval()
+        
+        # Get total number of layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            num_layers = len(self.model.model.layers)  # Gemma, Llama structure
+        elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+            num_layers = len(self.model.transformer.h)  # GPT-2 structure
+        else:
+            raise ValueError(f"Unsupported model architecture: {self.model_name}")
+        
+        # Calculate layer indices at 25%, 50%, 75% depth if not provided
+        if layer_indices is None:
+            depth_percentages = [0.25, 0.5, 0.75]
+            layer_indices = [int(num_layers * pct) for pct in depth_percentages]
+            print(f"Auto-calculated layer indices for {model_name} ({num_layers} layers): {layer_indices}")
+        
+        self.layer_indices = layer_indices
         
         # Store activations
         self.activations: Dict[int, torch.Tensor] = {}
@@ -431,6 +496,119 @@ def generate_activation_multilayer_dataset(
     return dataset
 
 
+def generate_rubric_dataset(
+    extractor: BaseModelActivationExtractor,
+    rubrics: List,  # List[RubricDefinition] from rubrics.py
+    neutral_prompts: List[str],
+    verifier=None,  # Verifier from rubrics.py
+    n_examples_per_rubric: int = 100,
+    layer_indices: Optional[List[int]] = None,
+    position: str = "last",
+) -> List:  # List[RubricExample]
+    """
+    Generate rubric-based dataset for policy training.
+    
+    Creates (prompt, rubric, response, label, activations) tuples by:
+    1. Taking neutral prompts
+    2. Generating responses from target model
+    3. Verifying rubric satisfaction with verifier
+    4. Extracting base activations f(x)
+    
+    Args:
+        extractor: BaseModelActivationExtractor for target model
+        rubrics: List of RubricDefinition objects
+        neutral_prompts: List of neutral prompts that don't strongly express behaviors
+        verifier: Verifier instance for scoring responses (optional)
+        n_examples_per_rubric: Number of examples to generate per rubric
+        layer_indices: Layers to extract activations from
+        position: Token position for activation extraction
+        
+    Returns:
+        List of RubricExample objects
+    """
+    if layer_indices is None:
+        layer_indices = extractor.layer_indices
+    
+    dataset = []
+    
+    for rubric in rubrics:
+        print(f"\nGenerating examples for rubric: {rubric.rubric_text[:50]}...")
+        
+        # Sample neutral prompts for this rubric
+        rubric_prompts = random.sample(
+            neutral_prompts,
+            min(n_examples_per_rubric, len(neutral_prompts))
+        )
+        
+        for i, prompt in enumerate(rubric_prompts):
+            if i % 20 == 0:
+                print(f"  Processed {i}/{len(rubric_prompts)} examples")
+            
+            try:
+                # 1. Extract base activations f(x)
+                activations = extractor.extract_activations(
+                    prompt=prompt,
+                    layer_indices=layer_indices,
+                    position=position,
+                )
+                
+                # 2. Generate response from target model
+                inputs = extractor.tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                ).to(extractor.device)
+                
+                with torch.no_grad():
+                    outputs = extractor.model.generate(
+                        **inputs,
+                        max_new_tokens=100,
+                        do_sample=False,
+                        pad_token_id=extractor.tokenizer.pad_token_id,
+                    )
+                
+                response = extractor.tokenizer.decode(
+                    outputs[0],
+                    skip_special_tokens=True
+                )
+                
+                # 3. Verify rubric satisfaction (if verifier provided)
+                if verifier is not None:
+                    score = verifier.verify(rubric, response)
+                    satisfies = score > 0.7  # Threshold for satisfaction
+                else:
+                    # Default: assume neutral prompts don't satisfy jailbreak rubrics
+                    score = 0.0
+                    satisfies = False
+                
+                # 4. Create RubricExample
+                example = RubricExample(
+                    prompt=prompt,
+                    rubric_text=rubric.rubric_text,
+                    target_answer=rubric.target_answer,
+                    category=rubric.category,
+                    response=response,
+                    satisfies_rubric=satisfies,
+                    verifier_score=score,
+                    activations_by_layer=activations,
+                    meta={
+                        "model_name": extractor.model_name,
+                        "position": position,
+                        "rubric_source": rubric.metadata.get("source", "unknown") if rubric.metadata else "unknown",
+                    }
+                )
+                
+                dataset.append(example)
+                
+            except Exception as e:
+                print(f"  Error processing example {i}: {e}")
+                continue
+    
+    print(f"\nGenerated {len(dataset)} rubric examples total.")
+    return dataset
+
+
 def save_dataset(
     dataset: List[ExampleDict],
     path: str,
@@ -493,10 +671,9 @@ if __name__ == "__main__":
         print("\nGenerating dataset with extracted activations...")
         print("  (This will download the base model if not cached)")
         
-        # Initialize extractor
+        # Initialize extractor (layers auto-calculated at 10%, 20%, 30%, 40%, 50% depth)
         extractor = BaseModelActivationExtractor(
             model_name="google/gemma-2-2b-it",
-            layer_indices=[7, 12, 23],
         )
         
         # Generate small dataset with extracted activations
