@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import sys
 from openai import OpenAI
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -396,16 +397,74 @@ def load_jailbreakbench_goals(
     from tqdm import tqdm
 
     print("Loading JailbreakBench goals...")
-    dataset = hf_load_dataset("JailbreakBench/JBB-Behaviors", "behaviors", split=split)
-    goals: List[str] = []
-
-    for idx, ex in enumerate(tqdm(dataset, total=min(num_goals, len(dataset)), desc="JailbreakBench goals")):
-        if idx >= num_goals:
-            break
-        goals.append(ex["Goal"])
-
-    print(f"Loaded {len(goals)} jailbreak goals")
-    return goals
+    
+    # Try streaming first to avoid memory issues
+    try:
+        print("  Attempting streaming mode...")
+        dataset = hf_load_dataset("JailbreakBench/JBB-Behaviors", "behaviors", split=split, streaming=True)
+        goals: List[str] = []
+        
+        for idx, ex in enumerate(tqdm(dataset, total=num_goals, desc="JailbreakBench goals")):
+            if idx >= num_goals:
+                break
+            if "Goal" in ex:
+                goals.append(ex["Goal"])
+            elif "goal" in ex:
+                goals.append(ex["goal"])
+            else:
+                # Try to find goal field
+                goal_key = None
+                for key in ex.keys():
+                    if "goal" in key.lower():
+                        goal_key = key
+                        break
+                if goal_key:
+                    goals.append(ex[goal_key])
+                else:
+                    print(f"  Warning: Could not find goal field in example {idx}, skipping")
+                    continue
+        
+        print(f"Loaded {len(goals)} jailbreak goals")
+        return goals
+        
+    except Exception as e:
+        print(f"  Streaming mode failed: {e}")
+        print("  Falling back to non-streaming mode...")
+        try:
+            # Fallback to non-streaming but with limit
+            dataset = hf_load_dataset("JailbreakBench/JBB-Behaviors", "behaviors", split=split)
+            goals: List[str] = []
+            
+            # Limit the dataset size to avoid memory issues
+            max_load = min(num_goals * 2, len(dataset))
+            
+            for idx, ex in enumerate(tqdm(dataset.select(range(max_load)), total=min(num_goals, max_load), desc="JailbreakBench goals")):
+                if len(goals) >= num_goals:
+                    break
+                if "Goal" in ex:
+                    goals.append(ex["Goal"])
+                elif "goal" in ex:
+                    goals.append(ex["goal"])
+                else:
+                    # Try to find goal field
+                    goal_key = None
+                    for key in ex.keys():
+                        if "goal" in key.lower():
+                            goal_key = key
+                            break
+                    if goal_key:
+                        goals.append(ex[goal_key])
+            
+            print(f"Loaded {len(goals)} jailbreak goals")
+            return goals[:num_goals]
+            
+        except Exception as e2:
+            print(f"  Non-streaming mode also failed: {e2}")
+            raise RuntimeError(
+                f"Failed to load JailbreakBench dataset. "
+                f"Streaming error: {e}, Non-streaming error: {e2}. "
+                f"Try reducing --num-samples or check your internet connection."
+            )
 
 
 def generate_jailbreak_rubrics_from_jbb(
@@ -641,18 +700,48 @@ if __name__ == "__main__":
     rubrics_path = "data/rubrics.json"
     triples_path = "data/rubric_triples.json"
 
-    # 1) Generate jailbreak rubrics from JailbreakBench.
-    generate_jailbreak_rubrics_from_jbb(
-        num_goals=args.num_samples,
-        output_path=rubrics_path,
-        verbose=True,
-    )
+    try:
+        # 1) Generate jailbreak rubrics from JailbreakBench.
+        print("\n" + "=" * 60)
+        print("STEP 1: Generating jailbreak rubrics from JailbreakBench")
+        print("=" * 60)
+        generate_jailbreak_rubrics_from_jbb(
+            num_goals=args.num_samples,
+            output_path=rubrics_path,
+            verbose=True,
+        )
+        print("✓ Step 1 complete\n")
 
-    # 2) Generate (x, R, a) triples using neutral prompts.
-    generate_and_save_rubric_triples(
-        dataset_name=args.dataset,
-        num_samples=args.num_samples,
-        rubrics_path=rubrics_path,
-        output_path=triples_path,
-        verbose=True,
-    )
+        # 2) Generate (x, R, a) triples using neutral prompts.
+        print("=" * 60)
+        print("STEP 2: Generating (x, R, a) triples from neutral prompts")
+        print("=" * 60)
+        generate_and_save_rubric_triples(
+            dataset_name=args.dataset,
+            num_samples=args.num_samples,
+            rubrics_path=rubrics_path,
+            output_path=triples_path,
+            verbose=True,
+        )
+        print("✓ Step 2 complete\n")
+        
+        print("=" * 60)
+        print("SUCCESS: All steps completed!")
+        print("=" * 60)
+        print(f"✓ Rubrics saved to: {rubrics_path}")
+        print(f"✓ Triples saved to: {triples_path}")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠ Interrupted by user")
+        sys.exit(1)
+    except MemoryError:
+        print("\n\n❌ Memory error! Try reducing --num-samples")
+        print("   Suggested: --num-samples 10 or --num-samples 20")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\n❌ Error: {e}")
+        print(f"   Error type: {type(e).__name__}")
+        import traceback
+        print("\nFull traceback:")
+        traceback.print_exc()
+        sys.exit(1)
