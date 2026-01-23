@@ -23,7 +23,11 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from pathlib import Path
 import json
+import sys
 from tqdm import tqdm
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.policy import ConceptExplainer
 from src.intervention import InterventionPipeline
@@ -452,14 +456,235 @@ def train_policy(
 
 
 if __name__ == "__main__":
-    print("Policy Training Module")
-    print("\nThis module implements the training pipeline for the policy network.")
-    print("\nTo run training:")
-    print("  1. Create ConceptExplainer")
-    print("  2. Create InterventionPipeline with target model")
-    print("  3. Create Verifier (LLM-as-judge)")
-    print("  4. Prepare rubrics and neutral prompts")
-    print("  5. Call train_policy()")
-    print("\nSee implementation_plan.md for full details.")
-    print("\nNote: We use the pretrained Karvonen Activation Oracle as-is")
-    print("      for interpretation (no AO training needed).")
+    import argparse
+    import os
+    from dotenv import load_dotenv
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    
+    # Load environment variables
+    load_dotenv()
+    
+    parser = argparse.ArgumentParser(
+        description="Train policy network to discover jailbreak activation interventions"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="google/gemma-2-2b-it",
+        help="Target model to intervene on (default: google/gemma-2-2b-it)"
+    )
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer index to intervene on (default: middle layer)"
+    )
+    parser.add_argument(
+        "--rubrics-path",
+        type=str,
+        default="data/rubrics.json",
+        help="Path to rubrics JSON file (default: data/rubrics.json)"
+    )
+    parser.add_argument(
+        "--triples-path",
+        type=str,
+        default="data/rubric_triples.json",
+        help="Path to rubric triples JSON file (default: data/rubric_triples.json)"
+    )
+    parser.add_argument(
+        "--n-exploration",
+        type=int,
+        default=100,
+        help="Number of exploration samples per rubric (default: 100)"
+    )
+    parser.add_argument(
+        "--n-epochs",
+        type=int,
+        default=10,
+        help="Number of training epochs (default: 10)"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Training batch size (default: 8)"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate (default: 1e-4)"
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="checkpoints/policy",
+        help="Directory to save checkpoints (default: checkpoints/policy)"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to run on (default: cuda if available, else cpu)"
+    )
+    parser.add_argument(
+        "--verifier-model",
+        type=str,
+        default="meta-llama/Llama-3.1-8B-Instruct",
+        help="Verifier model name (default: meta-llama/Llama-3.1-8B-Instruct)"
+    )
+    parser.add_argument(
+        "--max-rubrics",
+        type=int,
+        default=None,
+        help="Maximum number of rubrics to use (None = all, default: None)"
+    )
+    parser.add_argument(
+        "--max-prompts",
+        type=int,
+        default=500,
+        help="Maximum number of neutral prompts to use (default: 500)"
+    )
+    
+    args = parser.parse_args()
+    
+    print("=" * 60)
+    print("POLICY TRAINING - Jailbreak Activation Intervention Discovery")
+    print("=" * 60)
+    print(f"Target model: {args.model}")
+    print(f"Device: {args.device}")
+    print(f"Rubrics path: {args.rubrics_path}")
+    print(f"Triples path: {args.triples_path}")
+    print(f"Exploration samples/rubric: {args.n_exploration}")
+    print(f"Training epochs: {args.n_epochs}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Learning rate: {args.learning_rate}")
+    print("=" * 60)
+    
+    # 1. Load rubrics
+    print("\n[1/6] Loading rubrics...")
+    if not Path(args.rubrics_path).exists():
+        raise FileNotFoundError(
+            f"Rubrics file not found at {args.rubrics_path}. "
+            "Run 'python src/rubrics.py --dataset <name> --num-samples <n>' first."
+        )
+    
+    with open(args.rubrics_path, "r", encoding="utf-8") as f:
+        rubrics_data = json.load(f)
+    
+    rubrics: List[RubricDefinition] = []
+    for item in rubrics_data:
+        rubrics.append(
+            RubricDefinition(
+                rubric_text=item["rubric_text"],
+                target_answer=item.get("target_answer", "satisfies"),
+                category=item.get("category", "jailbreak"),
+                metadata=item.get("metadata", {}),
+            )
+        )
+    
+    if args.max_rubrics:
+        rubrics = rubrics[:args.max_rubrics]
+    
+    print(f"  ✓ Loaded {len(rubrics)} rubrics")
+    
+    # 2. Load neutral prompts from triples
+    print("\n[2/6] Loading neutral prompts...")
+    if not Path(args.triples_path).exists():
+        raise FileNotFoundError(
+            f"Rubric triples file not found at {args.triples_path}. "
+            "Run 'python src/rubrics.py --dataset <name> --num-samples <n>' first."
+        )
+    
+    from src.data import load_rubric_triples
+    triples = load_rubric_triples(args.triples_path)
+    
+    # Extract unique prompts
+    neutral_prompts = list(set([triple["prompt"] for triple in triples]))
+    if args.max_prompts:
+        neutral_prompts = neutral_prompts[:args.max_prompts]
+    
+    print(f"  ✓ Loaded {len(neutral_prompts)} unique neutral prompts")
+    
+    # 3. Initialize activation extractor
+    print("\n[3/6] Initializing activation extractor...")
+    print(f"  (This will download {args.model} if not cached)")
+    extractor = BaseModelActivationExtractor(
+        model_name=args.model,
+        layer_indices=None  # Auto-calculate layers
+    )
+    
+    # Determine layer index
+    if args.layer is None:
+        # Use middle layer
+        layer_idx = extractor.layer_indices[len(extractor.layer_indices) // 2]
+    else:
+        layer_idx = args.layer
+    
+    print(f"  ✓ Extractor ready (layers: {extractor.layer_indices}, using layer {layer_idx})")
+    
+    # 4. Initialize intervention pipeline
+    print("\n[4/6] Initializing intervention pipeline...")
+    # Reuse the same model from extractor
+    intervention_pipeline = InterventionPipeline(
+        model=extractor.model,
+        tokenizer=extractor.tokenizer,
+        device=args.device
+    )
+    print("  ✓ Intervention pipeline ready")
+    
+    # 5. Initialize verifier
+    print("\n[5/6] Initializing verifier...")
+    verifier = Verifier(
+        mode="llm",
+        model_name=args.verifier_model,
+        device=args.device
+    )
+    print("  ✓ Verifier ready")
+    
+    # 6. Initialize concept explainer
+    print("\n[6/6] Initializing concept explainer...")
+    # Get hidden dimension from model
+    if hasattr(extractor.model, 'model') and hasattr(extractor.model.model, 'layers'):
+        # Get hidden dim from first layer
+        d_hidden = extractor.model.model.layers[0].self_attn.head_dim * extractor.model.model.layers[0].self_attn.num_heads
+    else:
+        # Fallback: try to get from config
+        if hasattr(extractor.model, 'config'):
+            d_hidden = getattr(extractor.model.config, 'hidden_size', 2048)
+        else:
+            d_hidden = 2048  # Default fallback
+    
+    concept_explainer = ConceptExplainer(
+        d_hidden=d_hidden,
+        device=args.device
+    )
+    print(f"  ✓ Concept explainer ready (d_hidden={d_hidden})")
+    
+    # Run training
+    print("\n" + "=" * 60)
+    print("STARTING TRAINING")
+    print("=" * 60)
+    
+    trained_explainer, successful_examples = train_policy(
+        concept_explainer=concept_explainer,
+        intervention_pipeline=intervention_pipeline,
+        verifier=verifier,
+        rubrics=rubrics,
+        neutral_prompts=neutral_prompts,
+        extractor=extractor,
+        layer_idx=layer_idx,
+        n_exploration_samples=args.n_exploration,
+        n_training_epochs=args.n_epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        save_dir=args.save_dir,
+        device=args.device
+    )
+    
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"✓ Trained policy saved to: {args.save_dir}/policy_final.pt")
+    print(f"✓ Found {len(successful_examples)} successful interventions")
+    print("=" * 60)
