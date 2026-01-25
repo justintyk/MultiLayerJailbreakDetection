@@ -281,6 +281,12 @@ def main():
         default="adamkarvonen/checkpoints_cls_latentqa_past_lens_gemma-3-1b-it",
         help="Activation Oracle model name"
     )
+    parser.add_argument(
+        "--source-dim",
+        type=int,
+        default=None,
+        help="Source model hidden dimension (auto-detected from logs if not specified)"
+    )
     
     args = parser.parse_args()
     
@@ -311,13 +317,31 @@ def main():
     for f in log_files:
         print(f"  - {f}")
     
+    # Detect source hidden dimension from logs if not specified
+    source_dim = args.source_dim
+    if source_dim is None:
+        # Read first record to get delta_f dimension
+        for log_path in log_files:
+            if log_path.exists():
+                records = load_intervention_logs(log_path)
+                if records and 'delta_f' in records[0]:
+                    source_dim = len(records[0]['delta_f'])
+                    print(f"\nDetected source hidden dimension: {source_dim}")
+                    break
+    
     # Load Activation Oracle
     print(f"\nLoading Activation Oracle: {args.ao_model}")
     print("(This may take a moment...)")
     
     try:
-        oracle = MultiLayerActivationOracle(model_name=args.ao_model)
-        print("✓ Activation Oracle loaded successfully")
+        oracle = MultiLayerActivationOracle(
+            model_name=args.ao_model,
+            source_hidden_dim=source_dim
+        )
+        print(f"✓ Activation Oracle loaded successfully")
+        print(f"  AO hidden dimension: {oracle.ao_hidden_dim}")
+        if oracle.projection is not None:
+            print(f"  Projection: {source_dim} → {oracle.ao_hidden_dim}")
     except Exception as e:
         print(f"✗ Failed to load Activation Oracle: {e}")
         print("\nNote: The AO requires:")

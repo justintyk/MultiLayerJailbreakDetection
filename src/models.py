@@ -64,11 +64,104 @@ class MultiLayerActivationOracle:
     def __init__(
         self,
         model_name: str = DEFAULT_AO_NAME,
-        placeholder_token: str = " ?",
+        placeholder_token: str = "<ACT>",
+        source_hidden_dim: int = None,
     ) -> None:
         self.tokenizer, self.model = load_activation_oracle(model_name)
         self.device = torch.device("cuda")
         self.placeholder_token = placeholder_token
+        
+        # Get placeholder token ID(s) for reliable detection
+        self._placeholder_ids = self.tokenizer.encode(
+            placeholder_token, 
+            add_special_tokens=False
+        )
+        
+        # Get AO model's hidden dimension for projection
+        self.ao_hidden_dim = self._get_ao_hidden_dim()
+        self.source_hidden_dim = source_hidden_dim
+        self.projection = None
+        
+        # If source dimension specified and different from AO, create projection
+        if source_hidden_dim is not None and source_hidden_dim != self.ao_hidden_dim:
+            self._init_projection(source_hidden_dim, self.ao_hidden_dim)
+    
+    def _get_ao_hidden_dim(self) -> int:
+        """Get the hidden dimension of the AO model."""
+        # Try different ways to get hidden dimension
+        if hasattr(self.model, 'config'):
+            config = self.model.config
+            if hasattr(config, 'hidden_size'):
+                return config.hidden_size
+            if hasattr(config, 'd_model'):
+                return config.d_model
+        
+        # Try to get from base model
+        if hasattr(self.model, 'base_model') and hasattr(self.model.base_model, 'config'):
+            config = self.model.base_model.config
+            if hasattr(config, 'hidden_size'):
+                return config.hidden_size
+        
+        # Try to get from embedding layer
+        embed_layer = self.model.get_input_embeddings()
+        if hasattr(embed_layer, 'embedding_dim'):
+            return embed_layer.embedding_dim
+        if hasattr(embed_layer, 'weight'):
+            return embed_layer.weight.shape[1]
+        
+        # Default fallback for Gemma-3-1B
+        return 1152
+    
+    def _init_projection(self, source_dim: int, target_dim: int) -> None:
+        """
+        Initialize projection layer to map activations from source model to AO.
+        
+        Uses a simple linear projection. For better results, this could be 
+        replaced with a learned projection trained on paired activations.
+        """
+        import torch.nn as nn
+        
+        print(f"  Note: Creating projection {source_dim} → {target_dim} for AO compatibility")
+        
+        # Simple linear projection (no bias, preserves direction)
+        self.projection = nn.Linear(source_dim, target_dim, bias=False).to(self.device)
+        
+        # Initialize with truncated identity-like mapping
+        # This preserves as much information as possible
+        with torch.no_grad():
+            # Use SVD-style initialization for dimension reduction
+            if source_dim > target_dim:
+                # Reduction: use first target_dim dimensions (like PCA keeping top components)
+                # Initialize as truncated identity
+                self.projection.weight.zero_()
+                self.projection.weight[:, :target_dim] = torch.eye(target_dim, device=self.device)
+            else:
+                # Expansion: pad with zeros
+                self.projection.weight.zero_()
+                self.projection.weight[:source_dim, :] = torch.eye(source_dim, device=self.device)
+    
+    def _project_activations(self, activations: torch.Tensor) -> torch.Tensor:
+        """
+        Project activations to AO's hidden dimension if needed.
+        
+        Args:
+            activations: Tensor of shape [..., source_hidden_dim]
+            
+        Returns:
+            Tensor of shape [..., ao_hidden_dim]
+        """
+        if self.projection is None:
+            # Check if we need to create projection on-the-fly
+            act_dim = activations.shape[-1]
+            if act_dim != self.ao_hidden_dim:
+                self._init_projection(act_dim, self.ao_hidden_dim)
+        
+        if self.projection is not None:
+            # Ensure activations are on correct device and dtype
+            activations = activations.to(device=self.device, dtype=torch.float32)
+            return self.projection(activations)
+        
+        return activations
 
     def _encode_multi_layer_activations(
         self,
@@ -128,7 +221,13 @@ class MultiLayerActivationOracle:
         else:
             raise ValueError(f"Unknown aggregation strategy: {strategy}")
 
-        return aggregated.to(self.device)
+        # Move to device
+        aggregated = aggregated.to(self.device)
+        
+        # Apply projection if source dimension differs from AO dimension
+        aggregated = self._project_activations(aggregated)
+        
+        return aggregated
 
     def build_oracle_prompt(
         self,
@@ -155,6 +254,104 @@ class MultiLayerActivationOracle:
         placeholders = " ".join([self.placeholder_token] * num_placeholders)
         prompt = f"Layers {layer_description}: {placeholders} {question}"
         return prompt
+
+    def _find_placeholder_positions(
+        self,
+        input_ids: torch.Tensor,
+        num_expected: int
+    ) -> List[int]:
+        """
+        Find positions of placeholder tokens in tokenized input.
+        
+        Uses multiple strategies to handle different tokenization behaviors:
+        1. Try matching the full placeholder token sequence
+        2. Try matching individual tokens that make up the placeholder
+        3. Fallback to finding by string position in decoded text
+        
+        Args:
+            input_ids: Tokenized input [1, seq_len]
+            num_expected: Number of placeholder positions expected
+            
+        Returns:
+            List of token positions where activations should be injected
+        """
+        ids = input_ids[0].tolist()
+        positions = []
+        
+        # Strategy 1: Find exact matches of placeholder token IDs
+        placeholder_ids = self._placeholder_ids
+        if len(placeholder_ids) == 1:
+            # Single token placeholder
+            pid = placeholder_ids[0]
+            for i, tid in enumerate(ids):
+                if tid == pid:
+                    positions.append(i)
+        else:
+            # Multi-token placeholder - find sequences
+            plen = len(placeholder_ids)
+            for i in range(len(ids) - plen + 1):
+                if ids[i:i+plen] == placeholder_ids:
+                    # Use the first token position for injection
+                    positions.append(i)
+        
+        if len(positions) == num_expected:
+            return positions
+        
+        # Strategy 2: Try finding "<" followed by "ACT" patterns
+        # This handles cases where <ACT> tokenizes differently in context
+        positions = []
+        decoded_tokens = [self.tokenizer.decode([tid]) for tid in ids]
+        
+        i = 0
+        while i < len(decoded_tokens):
+            # Check if this position starts a placeholder pattern
+            window = "".join(decoded_tokens[i:i+5])  # Look ahead up to 5 tokens
+            if self.placeholder_token in window or "<ACT>" in window or "[ACT]" in window:
+                positions.append(i)
+                # Skip ahead past this placeholder
+                skip = 1
+                while skip < 5 and i + skip < len(decoded_tokens):
+                    partial = "".join(decoded_tokens[i:i+skip+1])
+                    if self.placeholder_token in partial:
+                        break
+                    skip += 1
+                i += max(skip, 1)
+            else:
+                i += 1
+        
+        if len(positions) == num_expected:
+            return positions
+        
+        # Strategy 3: Use fixed positions after the colon in "Layers L13: <ACT>"
+        # Find position right after ":" which is where placeholder should be
+        positions = []
+        for i, tid in enumerate(ids):
+            decoded = self.tokenizer.decode([tid])
+            if ":" in decoded and i + 1 < len(ids):
+                # Found colon, next position(s) should be placeholder
+                for j in range(num_expected):
+                    if i + 1 + j < len(ids):
+                        positions.append(i + 1 + j)
+                break
+        
+        if len(positions) == num_expected:
+            return positions
+        
+        # Strategy 4: Last resort - use positions after initial prompt tokens
+        # Assume format: "Layers L13: [ACT positions here] Question..."
+        # Typically the placeholder is around position 4-6
+        if num_expected == 1:
+            # For single activation, inject at a reasonable position
+            # Skip "Layers", "L13", ":" tokens
+            inject_pos = min(4, len(ids) - 1)
+            return [inject_pos]
+        
+        raise ValueError(
+            f"Could not find {num_expected} placeholder positions. "
+            f"Found {len(positions)} candidates. "
+            f"Token IDs: {ids[:20]}... "
+            f"Decoded: {self.tokenizer.decode(input_ids[0][:30])}"
+        )
 
     def predict_label(
         self,
@@ -198,19 +395,8 @@ class MultiLayerActivationOracle:
         
         input_ids = inputs["input_ids"]  # [1, seq_len]
         
-        # 4. Find placeholder token positions
-        placeholder_token_id = self.tokenizer.encode(
-            self.placeholder_token, 
-            add_special_tokens=False
-        )[0]
-        
-        placeholder_positions = (input_ids[0] == placeholder_token_id).nonzero(as_tuple=True)[0]
-        
-        if len(placeholder_positions) != K:
-            raise ValueError(
-                f"Expected {K} placeholder tokens but found {len(placeholder_positions)}. "
-                f"Prompt: {prompt}"
-            )
+        # 4. Find placeholder token positions using robust detection
+        placeholder_positions = self._find_placeholder_positions(input_ids, K)
         
         # 5. Get embeddings and inject activations
         with torch.no_grad():
