@@ -141,6 +141,7 @@ class BaseModelActivationExtractor:
         self,
         model_name: str = "google/gemma-2-2b-it",
         layer_indices: Optional[List[int]] = None,
+        device: Optional[str] = None,
     ):
         """
         Initialize the activation extractor.
@@ -151,7 +152,9 @@ class BaseModelActivationExtractor:
                           If None, automatically calculates layers at 10%, 20%, 30%, 40%, 50% depth.
         """
         self.model_name = model_name
-        self.device = torch.device("cuda")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
         
         # Load tokenizer and model
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -160,7 +163,7 @@ class BaseModelActivationExtractor:
             
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
         )
         self.model.to(self.device)
@@ -246,12 +249,21 @@ class BaseModelActivationExtractor:
         self._register_hooks(layer_indices)
         
         # Tokenize and run forward pass
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(self.device)
+        max_length = None
+        if hasattr(self.tokenizer, "model_max_length"):
+            if isinstance(self.tokenizer.model_max_length, int) and self.tokenizer.model_max_length < 100000:
+                max_length = self.tokenizer.model_max_length
+        
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+        }
+        if max_length:
+            tokenizer_kwargs.update({"truncation": True, "max_length": max_length})
+        else:
+            tokenizer_kwargs.update({"truncation": False})
+        
+        inputs = self.tokenizer(prompt, **tokenizer_kwargs).to(self.device)
         
         with torch.no_grad():
             _ = self.model(**inputs)

@@ -109,6 +109,23 @@ class InterventionPipeline:
         self.model.to(device)
         self.model.eval()
     
+    def _tokenize_prompt(self, prompt: str) -> Dict[str, torch.Tensor]:
+        max_length = None
+        if hasattr(self.tokenizer, "model_max_length"):
+            if isinstance(self.tokenizer.model_max_length, int) and self.tokenizer.model_max_length < 100000:
+                max_length = self.tokenizer.model_max_length
+        
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+        }
+        if max_length:
+            tokenizer_kwargs.update({"truncation": True, "max_length": max_length})
+        else:
+            tokenizer_kwargs.update({"truncation": False})
+        
+        return self.tokenizer(prompt, **tokenizer_kwargs).to(self.device)
+    
     def apply_intervention(
         self,
         prompt: str,
@@ -137,12 +154,7 @@ class InterventionPipeline:
             Generated text response
         """
         # Tokenize input
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True
-        ).to(self.device)
+        inputs = self._tokenize_prompt(prompt)
         
         # Define intervention function
         def intervention_fn(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -167,13 +179,15 @@ class InterventionPipeline:
         # Apply intervention and generate
         with ActivationHook(self.model, layer_idx, intervention_fn):
             with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    pad_token_id=self.tokenizer.pad_token_id
-                )
+                generate_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                if do_sample:
+                    generate_kwargs["temperature"] = temperature
+                
+                outputs = self.model.generate(**inputs, **generate_kwargs)
         
         # Decode response
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -203,12 +217,7 @@ class InterventionPipeline:
             Generated text response
         """
         # Tokenize input
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True
-        ).to(self.device)
+        inputs = self._tokenize_prompt(prompt)
         
         # Create intervention functions for each layer
         hooks = []
@@ -242,13 +251,15 @@ class InterventionPipeline:
                 hook.__enter__()
             
             try:
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    pad_token_id=self.tokenizer.pad_token_id
-                )
+                generate_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": do_sample,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                if do_sample:
+                    generate_kwargs["temperature"] = temperature
+                
+                outputs = self.model.generate(**inputs, **generate_kwargs)
             finally:
                 # Exit all hook contexts
                 for hook in hooks:

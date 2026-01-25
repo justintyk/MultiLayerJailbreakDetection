@@ -58,13 +58,17 @@ class ConceptEncoder(nn.Module):
         text = f"Rubric: {rubric.rubric_text} Target: {rubric.target_answer}"
         
         # Encode to embedding
-        embedding = self.encoder.encode(
-            text,
-            convert_to_tensor=True,
-            device=self.device
-        )
+        # Use no_grad since encoder is frozen, but clone to get normal tensor for autograd
+        with torch.no_grad():
+            embedding = self.encoder.encode(
+                text,
+                convert_to_tensor=True,
+                device=self.device
+            )
         
-        return embedding
+        # Clone to ensure it's a normal tensor (not inference tensor) for autograd
+        # This allows the tensor to flow through the policy network even though encoder is frozen
+        return embedding.clone().detach()
     
     def encode_batch(self, rubrics) -> torch.Tensor:
         """

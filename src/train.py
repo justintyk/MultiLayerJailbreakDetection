@@ -15,7 +15,8 @@ Key components:
 - train_policy(): Main training loop
 """
 
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any, Iterable
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,7 +33,96 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.policy import ConceptExplainer
 from src.intervention import InterventionPipeline
 from src.rubrics import RubricDefinition, Verifier
-from src.data import BaseModelActivationExtractor
+from src.data import BaseModelActivationExtractor, generate_rubric_dataset
+
+
+def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _serialize_rubric_dataset(
+    dataset: Iterable[Any],
+    output_path: Path
+) -> None:
+    serialized = []
+    for item in dataset:
+        if hasattr(item, "to_dict"):
+            serialized.append(item.to_dict())
+        elif isinstance(item, dict):
+            serialized.append(item)
+        else:
+            raise ValueError(f"Unsupported dataset item type: {type(item)}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(serialized, f, indent=2)
+
+
+def _load_rubric_dataset(path: Path) -> List[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_policy_training_examples(
+    rubric_examples: Iterable[Any],
+    layer_idx: int
+) -> List[Dict[str, Any]]:
+    """
+    Convert rubric dataset items into policy training examples.
+    
+    Each output example contains:
+    - rubric: RubricDefinition
+    - base_activation: tensor for layer_idx
+    - prompt: original prompt
+    """
+    training_examples: List[Dict[str, Any]] = []
+    for example in rubric_examples:
+        if hasattr(example, "activations_by_layer"):
+            activations_by_layer = example.activations_by_layer
+            rubric_text = example.rubric_text
+            target_answer = example.target_answer
+            category = getattr(example, "category", "jailbreak")
+            metadata = getattr(example, "meta", {})
+            prompt = example.prompt
+        elif isinstance(example, dict):
+            activations_by_layer = example["activations_by_layer"]
+            rubric_info = example.get("rubric", {})
+            rubric_text = rubric_info.get("rubric_text")
+            target_answer = rubric_info.get("target_answer")
+            category = rubric_info.get("category", "jailbreak")
+            metadata = example.get("meta", {})
+            prompt = example["prompt"]
+        else:
+            raise ValueError(f"Unsupported example type: {type(example)}")
+        
+        if rubric_text is None or target_answer is None:
+            raise ValueError("Rubric text and target answer are required for training examples.")
+        
+        layer_key = layer_idx
+        if layer_key not in activations_by_layer and str(layer_idx) in activations_by_layer:
+            layer_key = str(layer_idx)
+        
+        base_act = activations_by_layer[layer_key]
+        if not isinstance(base_act, torch.Tensor):
+            base_act = torch.tensor(base_act, dtype=torch.float32)
+        if base_act.dim() > 1:
+            base_act = base_act.squeeze(0)
+        
+        rubric = RubricDefinition(
+            rubric_text=rubric_text,
+            target_answer=target_answer,
+            category=category,
+            metadata=metadata
+        )
+        
+        training_examples.append({
+            "rubric": rubric,
+            "base_activation": base_act,
+            "prompt": prompt
+        })
+    
+    return training_examples
 
 
 class PolicyTrainingDataset(Dataset):
@@ -61,6 +151,35 @@ class PolicyTrainingDataset(Dataset):
         return self.examples[idx]
 
 
+def custom_collate_fn(batch: List[Dict]) -> Dict:
+    """
+    Custom collate function for PolicyTrainingDataset.
+    
+    Handles RubricDefinition objects and other non-tensor types properly.
+    """
+    # Separate items that need special handling
+    rubrics = [item['rubric'] for item in batch]
+    prompts = [item['prompt'] for item in batch]
+    
+    # Handle base_activation tensors
+    base_activations = []
+    for item in batch:
+        base_act = item['base_activation']
+        # Ensure it's a tensor
+        if not isinstance(base_act, torch.Tensor):
+            base_act = torch.tensor(base_act, dtype=torch.float32)
+        base_activations.append(base_act)
+    
+    # Stack tensors into a batch
+    base_activations_batch = torch.stack(base_activations)
+    
+    return {
+        'rubric': rubrics,
+        'base_activation': base_activations_batch,
+        'prompt': prompts
+    }
+
+
 def exploration_phase(
     concept_explainer: ConceptExplainer,
     intervention_pipeline: InterventionPipeline,
@@ -71,8 +190,9 @@ def exploration_phase(
     layer_idx: int,
     n_samples_per_rubric: int = 100,
     epsilon: float = 0.1,
-    success_threshold: float = 0.7,
-    device: str = "cuda"
+    success_threshold: float = 0.6,
+    device: str = "cuda",
+    log_dir: Optional[str] = None
 ) -> List[Dict]:
     """
     Exploration phase: Random perturbation sampling to find seed directions.
@@ -97,6 +217,7 @@ def exploration_phase(
         epsilon: Norm constraint coefficient
         success_threshold: Verifier score threshold for success
         device: Device to run on
+        log_dir: Optional directory to log successful interventions
         
     Returns:
         List of successful intervention examples
@@ -122,11 +243,7 @@ def exploration_phase(
                 layer_indices=[layer_idx],
                 position="last"
             )
-            base_f = torch.tensor(
-                activations[layer_idx][0],
-                dtype=torch.float32,
-                device=device
-            )
+            base_f = activations[layer_idx][0].detach().clone().to(device=device, dtype=torch.float32)
             
             # 3. Sample random intervention
             d_hidden = base_f.shape[0]
@@ -151,7 +268,7 @@ def exploration_phase(
                 
                 # 6. Store if successful
                 if score >= success_threshold:
-                    successful_examples.append({
+                    record = {
                         'rubric': rubric,
                         'base_activation': base_f.cpu(),
                         'intervention': delta_f.cpu(),
@@ -159,7 +276,23 @@ def exploration_phase(
                         'response': response,
                         'score': score,
                         'layer_idx': layer_idx
-                    })
+                    }
+                    successful_examples.append(record)
+                    if log_dir:
+                        _append_jsonl(
+                            Path(log_dir) / "exploration_success.jsonl",
+                            {
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "rubric_text": rubric.rubric_text,
+                                "target_answer": rubric.target_answer,
+                                "category": rubric.category,
+                                "prompt": prompt,
+                                "response": response,
+                                "score": score,
+                                "layer_idx": layer_idx,
+                                "delta_f": delta_f.detach().cpu().tolist()
+                            }
+                        )
                     rubric_successes += 1
                     
             except Exception as e:
@@ -184,7 +317,10 @@ def policy_gradient_phase(
     gamma: float = 0.99,
     entropy_coef: float = 0.01,
     device: str = "cuda",
-    save_dir: Optional[str] = None
+    save_dir: Optional[str] = None,
+    epsilon: float = 0.1,
+    log_dir: Optional[str] = None,
+    log_threshold: float = 0.6
 ) -> ConceptExplainer:
     """
     Policy gradient training phase using REINFORCE.
@@ -200,7 +336,7 @@ def policy_gradient_phase(
         concept_explainer: ConceptExplainer to train
         intervention_pipeline: InterventionPipeline for applying interventions
         verifier: Verifier for scoring
-        training_data: List of training examples from exploration
+        training_data: List of training examples from rubric dataset
         layer_idx: Layer to intervene on
         n_epochs: Number of training epochs
         batch_size: Batch size
@@ -209,6 +345,9 @@ def policy_gradient_phase(
         entropy_coef: Entropy regularization coefficient
         device: Device to run on
         save_dir: Directory to save checkpoints
+        epsilon: Norm constraint coefficient for interventions
+        log_dir: Optional directory to log high-scoring interventions
+        log_threshold: Score threshold for logging interventions
         
     Returns:
         Trained ConceptExplainer
@@ -216,6 +355,19 @@ def policy_gradient_phase(
     print(f"\n{'='*60}")
     print("POLICY GRADIENT PHASE: REINFORCE Training")
     print(f"{'='*60}")
+    
+    # Check if we have enough data
+    if len(training_data) == 0:
+        raise ValueError("No training data provided. Need at least 1 training example.")
+    
+    if len(training_data) < batch_size:
+        print(f"  Warning: Dataset size ({len(training_data)}) is smaller than batch size ({batch_size})")
+        print(f"  Reducing batch size to {len(training_data)}")
+        batch_size = len(training_data)
+    
+    # Ensure batch_size is at least 1
+    if batch_size < 1:
+        batch_size = 1
     
     # Setup optimizer
     optimizer = optim.Adam(
@@ -225,12 +377,28 @@ def policy_gradient_phase(
     
     # Create dataset and dataloader
     dataset = PolicyTrainingDataset(training_data)
+    # Use drop_last=False if dataset is small to ensure we get at least one batch
+    drop_last = len(training_data) > batch_size * 2
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True
+        drop_last=drop_last,
+        collate_fn=custom_collate_fn
     )
+    
+    print(f"  Dataset size: {len(training_data)}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Estimated batches per epoch: {len(dataloader)}")
+    
+    # Verify we have at least one batch
+    if len(dataloader) == 0:
+        raise ValueError(
+            f"No batches can be created! Dataset size ({len(training_data)}) is too small "
+            f"for batch size ({batch_size}) with drop_last={drop_last}. "
+            f"Try reducing batch_size or ensure you have more training examples."
+        )
     
     # Training loop
     for epoch in range(n_epochs):
@@ -255,8 +423,8 @@ def policy_gradient_phase(
             
             for i in range(batch_size_actual):
                 # Get distribution parameters
-                with torch.no_grad():
-                    concept_emb = concept_explainer.concept_encoder.encode(rubrics[i])
+                # Concept encoder is frozen but returns normal tensors (cloned in encode method)
+                concept_emb = concept_explainer.concept_encoder.encode(rubrics[i])
                 
                 mu, log_sigma = concept_explainer.policy_network(concept_emb)
                 
@@ -267,7 +435,7 @@ def policy_gradient_phase(
                 delta_f = concept_explainer.policy_network.enforce_constraint(
                     delta_f,
                     base_activations[i],
-                    epsilon=0.1
+                    epsilon=epsilon
                 )
                 
                 # Compute log probability
@@ -302,6 +470,22 @@ def policy_gradient_phase(
                     # Get reward from verifier
                     score = verifier.verify(rubrics[i], response)
                     rewards.append(score)
+                    
+                    if log_dir and score >= log_threshold:
+                        _append_jsonl(
+                            Path(log_dir) / "policy_success.jsonl",
+                            {
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "rubric_text": rubrics[i].rubric_text,
+                                "target_answer": rubrics[i].target_answer,
+                                "category": rubrics[i].category,
+                                "prompt": prompts[i],
+                                "response": response,
+                                "score": score,
+                                "layer_idx": layer_idx,
+                                "delta_f": interventions[i].detach().cpu().tolist()
+                            }
+                        )
                     
                 except Exception as e:
                     print(f"  Error in batch item {i}: {e}")
@@ -342,13 +526,19 @@ def policy_gradient_phase(
             n_batches += 1
         
         # Print epoch metrics
-        avg_loss = epoch_loss / n_batches
-        avg_reward = epoch_reward / n_batches
-        avg_entropy = epoch_entropy / n_batches
-        
-        print(f"  Loss: {avg_loss:.4f}")
-        print(f"  Avg Reward: {avg_reward:.4f}")
-        print(f"  Avg Entropy: {avg_entropy:.4f}")
+        if n_batches > 0:
+            avg_loss = epoch_loss / n_batches
+            avg_reward = epoch_reward / n_batches
+            avg_entropy = epoch_entropy / n_batches
+            
+            print(f"  Loss: {avg_loss:.4f}")
+            print(f"  Avg Reward: {avg_reward:.4f}")
+            print(f"  Avg Entropy: {avg_entropy:.4f}")
+        else:
+            print(f"  ⚠ No batches processed in this epoch!")
+            print(f"  Dataset size: {len(dataset)}, Batch size: {batch_size}")
+            print(f"  Skipping this epoch...")
+            continue
         
         # Save checkpoint
         if save_dir and (epoch + 1) % 5 == 0:
@@ -371,6 +561,7 @@ def train_policy(
     verifier: Verifier,
     rubrics: List[RubricDefinition],
     neutral_prompts: List[str],
+    triples_path: str,
     extractor: BaseModelActivationExtractor,
     layer_idx: int,
     n_exploration_samples: int = 100,
@@ -378,7 +569,14 @@ def train_policy(
     batch_size: int = 8,
     learning_rate: float = 1e-4,
     save_dir: str = "checkpoints/policy",
-    device: str = "cuda"
+    device: str = "cuda",
+    epsilon: float = 0.1,
+    use_rubric_dataset: bool = True,
+    dataset_path: Optional[str] = None,
+    max_train_examples: Optional[int] = None,
+    skip_exploration: bool = False,
+    log_dir: Optional[str] = None,
+    log_threshold: float = 0.6
 ) -> Tuple[ConceptExplainer, List[Dict]]:
     """
     Main training loop: Exploration + Policy Gradient.
@@ -389,6 +587,7 @@ def train_policy(
         verifier: Verifier for scoring
         rubrics: List of rubrics to train on
         neutral_prompts: List of neutral prompts
+        triples_path: Path to rubric triples JSON
         extractor: BaseModelActivationExtractor for base activations
         layer_idx: Layer to intervene on
         n_exploration_samples: Samples per rubric in exploration
@@ -397,6 +596,13 @@ def train_policy(
         learning_rate: Learning rate
         save_dir: Directory to save checkpoints
         device: Device to run on
+        epsilon: Norm constraint coefficient for interventions
+        use_rubric_dataset: Whether to train using full rubric dataset
+        dataset_path: Optional path to cached rubric dataset JSON
+        max_train_examples: Max rubric dataset examples to use
+        skip_exploration: Whether to skip exploration phase
+        log_dir: Optional directory to log interventions
+        log_threshold: Score threshold for logging interventions
         
     Returns:
         (trained_explainer, successful_examples)
@@ -410,36 +616,68 @@ def train_policy(
     print(f"Exploration samples/rubric: {n_exploration_samples}")
     print(f"Training epochs: {n_training_epochs}")
     
-    # Phase 1: Exploration
-    successful_examples = exploration_phase(
-        concept_explainer=concept_explainer,
-        intervention_pipeline=intervention_pipeline,
-        verifier=verifier,
-        rubrics=rubrics,
-        neutral_prompts=neutral_prompts,
-        extractor=extractor,
-        layer_idx=layer_idx,
-        n_samples_per_rubric=n_exploration_samples,
-        device=device
-    )
-    
-    if len(successful_examples) == 0:
-        print("\n⚠ No successful interventions found in exploration phase!")
-        print("  Try adjusting success_threshold or increasing n_samples")
-        return concept_explainer, []
+    successful_examples: List[Dict] = []
+    if not skip_exploration:
+        # Phase 1: Exploration (logging/bootstrapping only)
+        successful_examples = exploration_phase(
+            concept_explainer=concept_explainer,
+            intervention_pipeline=intervention_pipeline,
+            verifier=verifier,
+            rubrics=rubrics,
+            neutral_prompts=neutral_prompts,
+            extractor=extractor,
+            layer_idx=layer_idx,
+            n_samples_per_rubric=n_exploration_samples,
+            epsilon=epsilon,
+            device=device,
+            log_dir=log_dir
+        )
+        
+        if len(successful_examples) == 0:
+            print("\n⚠ No successful interventions found in exploration phase!")
+            print("  Proceeding to policy gradient training with full dataset...")
     
     # Phase 2: Policy Gradient Training
+    if use_rubric_dataset:
+        rubric_dataset = None
+        if dataset_path and Path(dataset_path).exists():
+            rubric_dataset = _load_rubric_dataset(Path(dataset_path))
+            if max_train_examples:
+                rubric_dataset = rubric_dataset[:max_train_examples]
+        else:
+            rubric_dataset = generate_rubric_dataset(
+                extractor=extractor,
+                triples_path=triples_path,
+                verifier=verifier,
+                layer_indices=[layer_idx],
+                position="last",
+                max_examples=max_train_examples,
+                verbose=True
+            )
+            if dataset_path:
+                _serialize_rubric_dataset(rubric_dataset, Path(dataset_path))
+        
+        training_data = build_policy_training_examples(
+            rubric_dataset,
+            layer_idx=layer_idx
+        )
+    else:
+        training_data = successful_examples
+    
     trained_explainer = policy_gradient_phase(
         concept_explainer=concept_explainer,
         intervention_pipeline=intervention_pipeline,
         verifier=verifier,
-        training_data=successful_examples,
+        training_data=training_data,
         layer_idx=layer_idx,
         n_epochs=n_training_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         device=device,
-        save_dir=save_dir
+        save_dir=save_dir,
+        epsilon=epsilon,
+        log_dir=log_dir,
+        log_threshold=log_threshold
     )
     
     # Save final model
@@ -448,6 +686,7 @@ def train_policy(
     torch.save({
         'policy_state_dict': trained_explainer.policy_network.state_dict(),
         'n_successful_examples': len(successful_examples),
+        'n_training_examples': len(training_data),
         'rubrics': [r.__dict__ for r in rubrics],
     }, final_path)
     print(f"\n✓ Saved final model: {final_path}")
@@ -534,6 +773,12 @@ if __name__ == "__main__":
         help="Verifier model name (default: meta-llama/Llama-3.1-8B-Instruct)"
     )
     parser.add_argument(
+        "--verifier-device",
+        type=str,
+        default="cpu",
+        help="Device for verifier model (default: cpu)"
+    )
+    parser.add_argument(
         "--max-rubrics",
         type=int,
         default=None,
@@ -544,6 +789,53 @@ if __name__ == "__main__":
         type=int,
         default=500,
         help="Maximum number of neutral prompts to use (default: 500)"
+    )
+    parser.add_argument(
+        "--no-rubric-dataset",
+        action="store_false",
+        dest="use_rubric_dataset",
+        help="Train only on exploration successes (skip full rubric dataset)"
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Optional path to cached rubric dataset JSON"
+    )
+    parser.add_argument(
+        "--max-train-examples",
+        type=int,
+        default=None,
+        help="Maximum rubric dataset examples to use (default: all)"
+    )
+    parser.add_argument(
+        "--skip-exploration",
+        action="store_true",
+        help="Skip exploration phase (policy gradient only)"
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.1,
+        help="Norm constraint coefficient for interventions (default: 0.1)"
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="logs/interventions",
+        help="Directory to log high-scoring interventions"
+    )
+    parser.add_argument(
+        "--log-threshold",
+        type=float,
+        default=0.6,
+        help="Verifier score threshold for logging interventions (default: 0.6)"
+    )
+    parser.add_argument(
+        "--explainer-ckpt",
+        type=str,
+        default=None,
+        help="Path to pretrained explainer checkpoint (optional)"
     )
     
     args = parser.parse_args()
@@ -559,6 +851,11 @@ if __name__ == "__main__":
     print(f"Training epochs: {args.n_epochs}")
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.learning_rate}")
+    print(f"Verifier device: {args.verifier_device}")
+    print(f"Use rubric dataset: {args.use_rubric_dataset}")
+    print(f"Skip exploration: {args.skip_exploration}")
+    print(f"Epsilon: {args.epsilon}")
+    print(f"Log dir: {args.log_dir}")
     print("=" * 60)
     
     # 1. Load rubrics
@@ -611,7 +908,8 @@ if __name__ == "__main__":
     print(f"  (This will download {args.model} if not cached)")
     extractor = BaseModelActivationExtractor(
         model_name=args.model,
-        layer_indices=None  # Auto-calculate layers
+        layer_indices=None,  # Auto-calculate layers
+        device=args.device,
     )
     
     # Determine layer index
@@ -638,28 +936,68 @@ if __name__ == "__main__":
     verifier = Verifier(
         mode="llm",
         model_name=args.verifier_model,
-        device=args.device
+        device=args.verifier_device
     )
     print("  ✓ Verifier ready")
     
     # 6. Initialize concept explainer
     print("\n[6/6] Initializing concept explainer...")
-    # Get hidden dimension from model
-    if hasattr(extractor.model, 'model') and hasattr(extractor.model.model, 'layers'):
-        # Get hidden dim from first layer
-        d_hidden = extractor.model.model.layers[0].self_attn.head_dim * extractor.model.model.layers[0].self_attn.num_heads
-    else:
-        # Fallback: try to get from config
-        if hasattr(extractor.model, 'config'):
-            d_hidden = getattr(extractor.model.config, 'hidden_size', 2048)
-        else:
-            d_hidden = 2048  # Default fallback
+    # Get hidden dimension from model config (most reliable method)
+    d_hidden = 2048  # Default fallback
+    if hasattr(extractor.model, 'config'):
+        # Try common config attribute names for hidden dimension
+        d_hidden = (
+            getattr(extractor.model.config, 'hidden_size', None) or
+            getattr(extractor.model.config, 'd_model', None) or
+            getattr(extractor.model.config, 'n_embd', None) or
+            2048
+        )
+    
+    # If config doesn't have it, try to infer from model structure
+    if d_hidden == 2048 and hasattr(extractor.model, 'model') and hasattr(extractor.model.model, 'layers'):
+        try:
+            first_layer = extractor.model.model.layers[0]
+            # Try different ways to get hidden dim from attention
+            if hasattr(first_layer, 'self_attn'):
+                attn = first_layer.self_attn
+                # Method 1: head_dim * num_heads (for Llama-style)
+                if hasattr(attn, 'head_dim') and hasattr(attn, 'num_heads'):
+                    d_hidden = attn.head_dim * attn.num_heads
+                # Method 2: num_heads * head_dim (alternative attribute names)
+                elif hasattr(attn, 'head_dim') and hasattr(attn, 'num_attention_heads'):
+                    d_hidden = attn.head_dim * attn.num_attention_heads
+                # Method 3: Get from q_proj weight shape (most reliable)
+                elif hasattr(attn, 'q_proj') and hasattr(attn.q_proj, 'weight'):
+                    # q_proj weight shape is typically [hidden_size, hidden_size] or [hidden_size, num_heads * head_dim]
+                    q_shape = attn.q_proj.weight.shape
+                    if len(q_shape) >= 2:
+                        d_hidden = q_shape[0]  # Input dimension
+            # Method 4: Get from mlp or feed_forward
+            elif hasattr(first_layer, 'mlp') and hasattr(first_layer.mlp, 'gate_proj'):
+                if hasattr(first_layer.mlp.gate_proj, 'weight'):
+                    d_hidden = first_layer.mlp.gate_proj.weight.shape[0]
+            elif hasattr(first_layer, 'feed_forward') and hasattr(first_layer.feed_forward, 'w1'):
+                if hasattr(first_layer.feed_forward.w1, 'weight'):
+                    d_hidden = first_layer.feed_forward.w1.weight.shape[0]
+        except Exception as e:
+            print(f"  Warning: Could not infer hidden dimension from model structure: {e}")
+            print(f"  Using default: {d_hidden}")
     
     concept_explainer = ConceptExplainer(
         d_hidden=d_hidden,
         device=args.device
     )
     print(f"  ✓ Concept explainer ready (d_hidden={d_hidden})")
+    
+    if args.explainer_ckpt:
+        ckpt_path = Path(args.explainer_ckpt)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Explainer checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=args.device)
+        if "policy_state_dict" not in ckpt:
+            raise KeyError("Checkpoint missing 'policy_state_dict'")
+        concept_explainer.policy_network.load_state_dict(ckpt["policy_state_dict"])
+        print(f"  ✓ Loaded explainer checkpoint from {ckpt_path}")
     
     # Run training
     print("\n" + "=" * 60)
@@ -672,6 +1010,7 @@ if __name__ == "__main__":
         verifier=verifier,
         rubrics=rubrics,
         neutral_prompts=neutral_prompts,
+        triples_path=args.triples_path,
         extractor=extractor,
         layer_idx=layer_idx,
         n_exploration_samples=args.n_exploration,
@@ -679,7 +1018,14 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         save_dir=args.save_dir,
-        device=args.device
+        device=args.device,
+        epsilon=args.epsilon,
+        use_rubric_dataset=args.use_rubric_dataset,
+        dataset_path=args.dataset_path,
+        max_train_examples=args.max_train_examples,
+        skip_exploration=args.skip_exploration,
+        log_dir=args.log_dir,
+        log_threshold=args.log_threshold
     )
     
     print("\n" + "=" * 60)

@@ -1,6 +1,4 @@
-# MultiLayerJailbreakDetection
-
-An end-to-end Activation Oracle model for detecting jailbreaks across multiple neural network layers
+# Steering Internal Activations to Reveal Jailbreak Concepts: An Activation-Investigator Framework
 
 ## Abstract
 This work investigates whether a single high-level behavioral concept (e.g., a jailbreak behavior) corresponds to multiple distinct activation patterns inside a large language model (LLM). We train an Activation Oracle that takes multi-layer activations from a target LLM and outputs natural-language safety assessments, enabling us to detect distributed jailbreak patterns that span multiple layers. Our approach uses activation-conditioned training following the LatentQA paradigm, where activation vectors are injected at placeholder positions during supervised fine-tuning.
@@ -32,7 +30,7 @@ To modify the dataset size or model configuration, edit the parameters in `src/d
 ```python
 # Initialize extractor
 extractor = BaseModelActivationExtractor(
-    model_name="google/gemma-2-2b-it",
+    model_name="google/gemma-2-2b-it",  # Base model
     layer_indices=[7, 12, 23],
 )
 
@@ -68,7 +66,7 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @misc{multilayerjailbreakdetection2026,
-  title={Multi-Layer Jailbreak Detection using Activation Oracles},
+  title={Steering Internal Activations to Reveal Jailbreak Concepts: An Activation-Investigator Framework},
   author={Justin Ku},
   year={2026},
   url={https://github.com/justintyk/MultiLayerJailbreakDetection}
@@ -77,6 +75,6 @@ If you use this code in your research, please cite:
 
 ## References
 
+- [Eliciting Language Model Behaviors with Investigator Agents](https://transluce.org/automated-elicitation)
 - [LatentQA: Teaching LLMs to Decode Activations Into Natural Language](https://github.com/aypan17/latentqa)
-- [Activation Oracles](https://huggingface.co/collections/adamkarvonen/activation-oracles)
-- [JailbreakBench](https://jailbreakbench.github.io/)
+- [Activation Oracles: Training and Evaluating LLMs as General-Purpose Activation Explainers](https://arxiv.org/abs/2512.15674)
